@@ -100,7 +100,11 @@ Problem::init_custom_pert(
     const Real* dx = geomdata.CellSize();
     const Real x = prob_lo[0] + (i + 0.5) * dx[0];
     const Real y = prob_lo[1] + (j + 0.5) * dx[1];
-    const Real z = (z_cc) ? z_cc(i,j,k) : prob_lo[2] + (k + 0.5) * dx[2];
+    const Real z_tot = (z_cc) ? z_cc(i,j,k) : prob_lo[2] + (k + 0.5) * dx[2];
+    // "z" is measured as distance from cell center to ground
+    const Real z_sfc = 0.25 * ( z_nd(i,j  ,0) + z_nd(i+1,j  ,0)
+                              +z_nd(i,j+1,0) + z_nd(i+1,j+1,0));
+    const Real z = std::max((z_cc(i,j,k)-z_sfc),0.0);
 
     // Define a point (xc,yc,zc) at the center of the domain
     const Real xc = 0.5 * (prob_lo[0] + prob_hi[0]);
