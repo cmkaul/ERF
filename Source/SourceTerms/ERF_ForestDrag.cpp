@@ -111,8 +111,7 @@ ForestDrag::define_drag_field (const BoxArray& ba,
                 const Real z = std::max((z_cc(i,j,k)-z_sfc),0.0);
 
                 // Proximity to the forest
-                const Real radius = std::sqrt((x - xf) * (x - xf) +
-                                              (y - yf) * (y - yf));
+                const Real radius = std::sqrt((x - xf) * (x - xf));
 
                 // Hit for canopy region
                 Real factor = 1;
