@@ -14,9 +14,41 @@
 
 #include <iostream>
 
+/*
+ * LineSampler Namelist Options (erf namespace)
+ *
+ * The following options control line sampling in ERF:
+ *
+ * 1. Integer index-based lines (backward compatible):
+ *    - sample_line_lo:   int array, shape (N_lines*3), lower endpoint (i,j,k) for each line
+ *    - sample_line_hi:   int array, shape (N_lines*3), upper endpoint (i,j,k) for each line
+ *    - sample_line_dir:  int array, shape (N_lines), direction (0=x, 1=y, 2=z) for each line
+ *    - sample_line_name: string array, optional, names for each line (default: plt_line_#####)
+ *
+ * 2. Physical coordinate-based lines (preferred for new use):
+ *    - sample_line_phys_lo: real array, shape (N_lines*3), lower endpoint (lat, lon, z_phys) for each line
+ *    - sample_line_phys_hi: real array, shape (N_lines*3), upper endpoint (lat, lon, z_phys) for each line
+ *      (lat, lon in degrees, z_phys in meters)
+ *    - sample_line_name: string array, optional, names for each line (default: plt_line_#####)
+ *      (If both index and physical options are present, physical is used.)
+ *
+ * 3. Variable selection and output:
+ *    - line_sampling_vars: string array, variables to sample (e.g., density, x_velocity, theta, ...)
+ *    - line_sampling_text_output: bool, if true, write ASCII output for each variable/line
+ *
+ * Notes:
+ *  - Both vertical and horizontal lines are supported.
+ *  - For physical coordinates, the code finds the nearest (i,j,k) for each endpoint using lat/lon/z_phys MultiFabs.
+ *  - Verbose output is printed during setup, showing requested and actual endpoints.
+ *  - All options are under the 'erf' ParmParse namespace.
+ */
 struct LineSampler
 {
-    LineSampler ()
+    // Pass lat_m, lon_m, z_phys_cc as optional pointers (nullptr if not used)
+    LineSampler (
+        const amrex::Vector<std::unique_ptr<amrex::MultiFab>>* lat_m_in = nullptr,
+        const amrex::Vector<std::unique_ptr<amrex::MultiFab>>* lon_m_in = nullptr,
+        const amrex::Vector<std::unique_ptr<amrex::MultiFab>>* z_phys_cc_in = nullptr)
     {
         amrex::ParmParse pp("erf");
 
@@ -24,11 +56,192 @@ struct LineSampler
         int n_line_lo  = pp.countval("sample_line_lo") / AMREX_SPACEDIM;
         int n_line_hi  = pp.countval("sample_line_hi") / AMREX_SPACEDIM;
         int n_line_dir = pp.countval("sample_line_dir");
-        AMREX_ALWAYS_ASSERT( (n_line_lo==n_line_hi ) &&
-                             (n_line_lo==n_line_dir) );
 
-        // Parse the data
-        if (n_line_lo > 0) {
+        // New: support for (lat, lon, z_phys) input
+        int n_line_phys_lo = pp.countval("sample_line_phys_lo") / AMREX_SPACEDIM;
+        int n_line_phys_hi = pp.countval("sample_line_phys_hi") / AMREX_SPACEDIM;
+        bool use_phys = (n_line_phys_lo > 0 && n_line_phys_lo == n_line_phys_hi);
+
+        // Validation: check consistency based on which mode is used
+        if (use_phys) {
+            AMREX_ALWAYS_ASSERT( n_line_phys_lo == n_line_dir );
+        } else if (n_line_lo > 0) {
+            AMREX_ALWAYS_ASSERT( (n_line_lo==n_line_hi ) && (n_line_lo==n_line_dir) );
+        }
+
+        // Helper lambda for nearest neighbor search in MultiFabs
+        // Strategy: First find best horizontal (lat,lon) match, then find nearest z at that location
+        auto find_ijk_from_latlonz = [](amrex::Real lat, amrex::Real lon, amrex::Real z_phys,
+                                        const amrex::MultiFab* latmf, const amrex::MultiFab* lonmf, const amrex::MultiFab* zmf) -> amrex::IntVect {
+            amrex::IntVect best_ijk(0,0,0);
+            amrex::Real best_lat = 0, best_lon = 0, best_z = 0;
+            amrex::Real min_z = 1e30, max_z = -1e30;
+            
+            // Step 1: Find best horizontal (i,j) location by minimizing lat/lon distance
+            // Scan all FABs and use MPI reduction to find global best
+            struct HorizResult { amrex::Real dist; int i; int j; };
+            HorizResult local_best{1e30, 0, 0};
+            
+            for (amrex::MFIter mfi(*latmf); mfi.isValid(); ++mfi) {
+                const auto& latarr = latmf->array(mfi);
+                const auto& lonarr = lonmf->array(mfi);
+                const amrex::Box& bx = mfi.validbox();
+                
+                // Scan k=0 to find horizontal position (assuming lat/lon don't vary with k)
+                int k = bx.smallEnd(2);
+                for (int j = bx.smallEnd(1); j <= bx.bigEnd(1); ++j) {
+                    for (int i = bx.smallEnd(0); i <= bx.bigEnd(0); ++i) {
+                        amrex::Real dlat = latarr(i,j,k) - lat;
+                        amrex::Real dlon = lonarr(i,j,k) - lon;
+                        amrex::Real horiz_dist = dlat*dlat + dlon*dlon;
+                        if (horiz_dist < local_best.dist) {
+                            local_best = {horiz_dist, i, j};
+                        }
+                    }
+                }
+            }
+            
+            // MPI reduction to find global best horizontal position
+            amrex::Real global_min_dist = local_best.dist;
+            amrex::ParallelDescriptor::ReduceRealMin(global_min_dist);
+            int best_i = local_best.i;
+            int best_j = local_best.j;
+            if (local_best.dist > global_min_dist) {
+                // This rank doesn't have the best match, use dummy values
+                best_i = -1;
+                best_j = -1;
+            }
+            // Broadcast best (i,j) from the rank that has it
+            int rank_with_best = (local_best.dist == global_min_dist) ? amrex::ParallelDescriptor::MyProc() : -1;
+            amrex::ParallelDescriptor::ReduceIntMax(rank_with_best);
+            amrex::ParallelDescriptor::Bcast(&best_i, 1, rank_with_best);
+            amrex::ParallelDescriptor::Bcast(&best_j, 1, rank_with_best);
+            
+            // Step 2: At the best (i,j), find the k-level with closest z_phys
+            // Scan ALL FABs to find z range and best k
+            struct VertResult { amrex::Real dist; int k; amrex::Real z; amrex::Real lat; amrex::Real lon; };
+            VertResult local_vert{1e30, 0, 0.0, 0.0, 0.0};
+            
+            for (amrex::MFIter mfi(*zmf); mfi.isValid(); ++mfi) {
+                const auto& latarr = latmf->array(mfi);
+                const auto& lonarr = lonmf->array(mfi);
+                const auto& zarr   = zmf->array(mfi);
+                const amrex::Box& bx = mfi.validbox();
+                
+                // Check if this FAB contains our (best_i, best_j) in horizontal
+                amrex::IntVect test_point(best_i, best_j, bx.smallEnd(2));
+                if (bx.contains(test_point)) {
+                    for (int k = bx.smallEnd(2); k <= bx.bigEnd(2); ++k) {
+                        amrex::Real z_here = zarr(best_i, best_j, k);
+                        min_z = std::min(min_z, z_here);
+                        max_z = std::max(max_z, z_here);
+                        
+                        amrex::Real dz = std::abs(z_here - z_phys);
+                        if (dz < local_vert.dist) {
+                            local_vert = {dz, k, z_here, latarr(best_i, best_j, k), lonarr(best_i, best_j, k)};
+                        }
+                    }
+                }
+            }
+            
+            // MPI reduction to find global z range and best k
+            amrex::ParallelDescriptor::ReduceRealMin(min_z);
+            amrex::ParallelDescriptor::ReduceRealMax(max_z);
+            amrex::Real global_min_z_dist = local_vert.dist;
+            amrex::ParallelDescriptor::ReduceRealMin(global_min_z_dist);
+            
+            int best_k = local_vert.k;
+            best_z = local_vert.z;
+            best_lat = local_vert.lat;
+            best_lon = local_vert.lon;
+            
+            // Broadcast best k info from rank that has it
+            int rank_with_best_k = (local_vert.dist == global_min_z_dist && local_vert.dist < 1e29) ? amrex::ParallelDescriptor::MyProc() : -1;
+            amrex::ParallelDescriptor::ReduceIntMax(rank_with_best_k);
+            if (rank_with_best_k >= 0) {
+                amrex::ParallelDescriptor::Bcast(&best_k, 1, rank_with_best_k);
+                amrex::ParallelDescriptor::Bcast(&best_z, 1, rank_with_best_k);
+                amrex::ParallelDescriptor::Bcast(&best_lat, 1, rank_with_best_k);
+                amrex::ParallelDescriptor::Bcast(&best_lon, 1, rank_with_best_k);
+            }
+            
+            best_ijk = amrex::IntVect(best_i, best_j, best_k);
+            amrex::Print() << "  [z_phys range in grid: " << min_z << " to " << max_z 
+                          << ", matched cell has (lat,lon,z_phys)=(" 
+                          << best_lat << "," << best_lon << "," << best_z << ")]" << std::endl;
+            return best_ijk;
+        };
+
+        if (use_phys) {
+            // Only proceed if all required MultiFabs are provided
+            if (!lat_m_in || !lon_m_in || !z_phys_cc_in) {
+                amrex::Abort("LineSampler: lat_m, lon_m, z_phys_cc MultiFabs must be provided for physical line sampling!");
+            }
+            // Parse direction array first (needed for consistency checks)
+            m_dir.resize(n_line_dir);
+            pp.queryarr("sample_line_dir",m_dir,0,n_line_dir);
+            
+            int lev = 0;
+            amrex::Vector<amrex::Real> phys_lo; phys_lo.resize(n_line_phys_lo*AMREX_SPACEDIM);
+            amrex::Vector<amrex::IntVect> iv_lo; iv_lo.resize(n_line_phys_lo);
+            pp.queryarr("sample_line_phys_lo",phys_lo,0,n_line_phys_lo*AMREX_SPACEDIM);
+            for (int i(0); i < n_line_phys_lo; i++) {
+                amrex::Real lat = phys_lo[AMREX_SPACEDIM*i+0];
+                amrex::Real lon = phys_lo[AMREX_SPACEDIM*i+1];
+                amrex::Real z_phys = phys_lo[AMREX_SPACEDIM*i+2];
+                amrex::IntVect iv = find_ijk_from_latlonz(lat, lon, z_phys,
+                    (*lat_m_in)[lev].get(), (*lon_m_in)[lev].get(), (*z_phys_cc_in)[lev].get());
+                iv_lo[i] = iv;
+                amrex::Print() << "LineSampler: requested lo (lat,lon,z_phys)=(" << lat << "," << lon << "," << z_phys << ") -> (i,j,k)=" << iv << std::endl;
+            }
+            amrex::Vector<amrex::Real> phys_hi; phys_hi.resize(n_line_phys_hi*AMREX_SPACEDIM);
+            amrex::Vector<amrex::IntVect> iv_hi; iv_hi.resize(n_line_phys_hi);
+            pp.queryarr("sample_line_phys_hi",phys_hi,0,n_line_phys_hi*AMREX_SPACEDIM);
+            for (int i(0); i < n_line_phys_hi; i++) {
+                amrex::Real lat = phys_hi[AMREX_SPACEDIM*i+0];
+                amrex::Real lon = phys_hi[AMREX_SPACEDIM*i+1];
+                amrex::Real z_phys = phys_hi[AMREX_SPACEDIM*i+2];
+                amrex::IntVect iv = find_ijk_from_latlonz(lat, lon, z_phys,
+                    (*lat_m_in)[lev].get(), (*lon_m_in)[lev].get(), (*z_phys_cc_in)[lev].get());
+                iv_hi[i] = iv;
+                amrex::Print() << "LineSampler: requested hi (lat,lon,z_phys)=(" << lat << "," << lon << "," << z_phys << ") -> (i,j,k)=" << iv << std::endl;
+            }
+            m_bnd_bx.resize(n_line_phys_lo);
+            for (int i = 0; i < n_line_phys_hi; i++){
+                amrex::Box lbx(iv_lo[i],iv_hi[i]);
+                m_bnd_bx[i] = lbx;
+                amrex::Print() << "LineSampler: created line box from " << iv_lo[i] << " to " << iv_hi[i] << std::endl;
+                // Consistency check: only one index should change along the specified direction
+                int dir = m_dir.size() > i ? m_dir[i] : -1;
+                if (dir >= 0 && dir < AMREX_SPACEDIM) {
+                    bool consistent = true;
+                    for (int d = 0; d < AMREX_SPACEDIM; ++d) {
+                        if (d == dir) {
+                            if (iv_lo[i][d] == iv_hi[i][d]) consistent = false;
+                        } else {
+                            if (iv_lo[i][d] != iv_hi[i][d]) consistent = false;
+                        }
+                    }
+                    if (!consistent) {
+                        amrex::Print() << "WARNING: sample_line_phys endpoints for line " << i << " are not consistent with sample_line_dir=" << dir << "." << std::endl;
+                    }
+                }
+            }
+            // Parse names
+            std::string name_base = "plt_line_";
+            m_name.resize(n_line_phys_lo);
+            int n_names = pp.countval("sample_line_name");
+            if (n_names > 0) {
+                AMREX_ALWAYS_ASSERT( n_names==n_line_phys_lo );
+                pp.queryarr("sample_line_name",m_name,0,n_names);
+            } else {
+                for (int iline(0); iline<n_line_phys_lo; ++iline) {
+                    m_name[iline] = amrex::Concatenate(name_base, iline , 5);
+                }
+            }
+            m_lev.resize(n_line_phys_lo,0);
+            m_ls_mf.resize(n_line_phys_lo);
+        } else if (n_line_lo > 0) {
             // Parse lo
             amrex::Vector<int> idx_lo; idx_lo.resize(n_line_lo*AMREX_SPACEDIM);
             amrex::Vector<amrex::IntVect> iv_lo; iv_lo.resize(n_line_lo);
@@ -39,7 +252,6 @@ struct LineSampler
                                   idx_lo[AMREX_SPACEDIM*i+2]);
                 iv_lo[i] = iv;
             }
-
             // Parse hi
             amrex::Vector<int> idx_hi; idx_hi.resize(n_line_hi*AMREX_SPACEDIM);
             amrex::Vector<amrex::IntVect> iv_hi; iv_hi.resize(n_line_hi);
@@ -50,18 +262,13 @@ struct LineSampler
                                   idx_hi[AMREX_SPACEDIM*i+2]);
                 iv_hi[i] = iv;
             }
-
-            // Construct vector of bounding boxes
             m_bnd_bx.resize(n_line_lo);
             for (int i = 0; i < n_line_hi; i++){
                 amrex::Box lbx(iv_lo[i],iv_hi[i]);
                 m_bnd_bx[i] = lbx;
             }
-
-            // Parse directionality
             m_dir.resize(n_line_dir);
             pp.queryarr("sample_line_dir",m_dir,0,n_line_dir);
-
             // Parse names
             std::string name_base = "plt_line_";
             m_name.resize(n_line_lo);
@@ -74,75 +281,89 @@ struct LineSampler
                     m_name[iline] = amrex::Concatenate(name_base, iline , 5);
                 }
             }
-
-            // Allocate space for level indicator
             m_lev.resize(n_line_dir,0);
-
-            // Allocate space for MF pointers
             m_ls_mf.resize(n_line_lo);
-
-            // Get requested vars
-            if (pp.countval("line_sampling_vars") > 0) {
-                m_varnames.clear();
-                amrex::Vector<std::string> requested_vars;
-                pp.queryarr("line_sampling_vars",requested_vars);
-                amrex::Print() << "Selected line sampling vars :";
-                if (containerHasElement(requested_vars, "density")) {
-                    m_varnames.push_back("density");
-                    amrex::Print() << " " << "density";
-                }
-                if (containerHasElement(requested_vars, "x_velocity")) {
-                    m_varnames.push_back("x_velocity");
-                    amrex::Print() << " " << "x_velocity";
-                }
-                if (containerHasElement(requested_vars, "y_velocity")) {
-                    m_varnames.push_back("y_velocity");
-                    amrex::Print() << " " << "y_velocity";
-                }
-                if (containerHasElement(requested_vars, "z_velocity")) {
-                    m_varnames.push_back("z_velocity");
-                    amrex::Print() << " " << "z_velocity";
-                }
-                if (containerHasElement(requested_vars, "magvel")) {
-                    m_varnames.push_back("magvel");
-                    amrex::Print() << " " << "magvel";
-                }
-                if (containerHasElement(requested_vars, "theta")) {
-                    m_varnames.push_back("theta");
-                    amrex::Print() << " " << "theta";
-                }
-                if (containerHasElement(requested_vars, "qv")) {
-                    m_varnames.push_back("qv");
-                    amrex::Print() << " " << "qv";
-                }
-                if (containerHasElement(requested_vars, "qc")) {
-                    m_varnames.push_back("qc");
-                    amrex::Print() << " " << "qc";
-                }
-                if (containerHasElement(requested_vars, "pressure")) {
-                    m_varnames.push_back("pressure");
-                    amrex::Print() << " " << "pressure";
-                }
-                amrex::Print() << std::endl;
-            }
-
-            // Write outputs to text files, one file per variable, with all
-            // times appended to the same file
-            pp.query("line_sampling_text_output",m_write_ascii);
-            if (m_write_ascii && amrex::ParallelDescriptor::IOProcessor()) {
-                int nvar = static_cast<int>(m_varnames.size());
-                m_datastream.resize(n_line_lo * nvar);
-                int i = 0;
-                for (int iline(0); iline<n_line_lo; ++iline) {
-                    for (int ivar(0); ivar<nvar; ++ivar) {
-                        std::string filename = m_name[iline] + "." + m_varnames[ivar];
-                        m_datastream[i] = std::make_unique<std::fstream>();
-                        m_datastream[i]->open(filename.c_str(),std::ios::out|std::ios::app);
-                        if (!m_datastream[i]->good()) {
-                            amrex::FileOpenFailed(filename);
+            // Consistency check: only one index should change along the specified direction
+            for (int i = 0; i < n_line_lo; ++i) {
+                int dir = m_dir.size() > i ? m_dir[i] : -1;
+                if (dir >= 0 && dir < AMREX_SPACEDIM) {
+                    bool consistent = true;
+                    for (int d = 0; d < AMREX_SPACEDIM; ++d) {
+                        if (d == dir) {
+                            if (iv_lo[i][d] == iv_hi[i][d]) consistent = false;
+                        } else {
+                            if (iv_lo[i][d] != iv_hi[i][d]) consistent = false;
                         }
-                        i++;
                     }
+                    if (!consistent) {
+                        amrex::Print() << "WARNING: sample_line_lo/hi endpoints for line " << i << " are not consistent with sample_line_dir=" << dir << "." << std::endl;
+                    }
+                }
+            }
+        }
+
+        // Get requested vars
+        if (pp.countval("line_sampling_vars") > 0) {
+            m_varnames.clear();
+            amrex::Vector<std::string> requested_vars;
+            pp.queryarr("line_sampling_vars",requested_vars);
+            amrex::Print() << "Selected line sampling vars :";
+            if (containerHasElement(requested_vars, "density")) {
+                m_varnames.push_back("density");
+                amrex::Print() << " " << "density";
+            }
+            if (containerHasElement(requested_vars, "x_velocity")) {
+                m_varnames.push_back("x_velocity");
+                amrex::Print() << " " << "x_velocity";
+            }
+            if (containerHasElement(requested_vars, "y_velocity")) {
+                m_varnames.push_back("y_velocity");
+                amrex::Print() << " " << "y_velocity";
+            }
+            if (containerHasElement(requested_vars, "z_velocity")) {
+                m_varnames.push_back("z_velocity");
+                amrex::Print() << " " << "z_velocity";
+            }
+            if (containerHasElement(requested_vars, "magvel")) {
+                m_varnames.push_back("magvel");
+                amrex::Print() << " " << "magvel";
+            }
+            if (containerHasElement(requested_vars, "theta")) {
+                m_varnames.push_back("theta");
+                amrex::Print() << " " << "theta";
+            }
+            if (containerHasElement(requested_vars, "qv")) {
+                m_varnames.push_back("qv");
+                amrex::Print() << " " << "qv";
+            }
+            if (containerHasElement(requested_vars, "qc")) {
+                m_varnames.push_back("qc");
+                amrex::Print() << " " << "qc";
+            }
+            if (containerHasElement(requested_vars, "pressure")) {
+                m_varnames.push_back("pressure");
+                amrex::Print() << " " << "pressure";
+            }
+            amrex::Print() << std::endl;
+        }
+
+        // Write outputs to text files, one file per variable, with all
+        // times appended to the same file
+        pp.query("line_sampling_text_output",m_write_ascii);
+    int n_lines = use_phys ? n_line_phys_lo : n_line_lo;
+        if (m_write_ascii && amrex::ParallelDescriptor::IOProcessor()) {
+            int nvar = static_cast<int>(m_varnames.size());
+            m_datastream.resize(n_lines * nvar);
+            int i = 0;
+            for (int iline(0); iline<n_lines; ++iline) {
+                for (int ivar(0); ivar<nvar; ++ivar) {
+                    std::string filename = m_name[iline] + "." + m_varnames[ivar];
+                    m_datastream[i] = std::make_unique<std::fstream>();
+                    m_datastream[i]->open(filename.c_str(),std::ios::out|std::ios::app);
+                    if (!m_datastream[i]->good()) {
+                        amrex::FileOpenFailed(filename);
+                    }
+                    i++;
                 }
             }
         }

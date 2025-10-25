@@ -1759,7 +1759,8 @@ ERF::InitData_post ()
         if (line_sampling_interval < 0 && line_sampling_per < 0) {
             Abort("Need to specify line_sampling_interval or line_sampling_per");
         }
-        line_sampler = std::make_unique<LineSampler>();
+        // Pass lat_m, lon_m, z_phys_cc as required by new LineSampler interface
+        line_sampler = std::make_unique<LineSampler>(&lat_m, &lon_m, &z_phys_cc);
         line_sampler->write_coords(z_phys_cc);
     }
     if (do_plane) {
