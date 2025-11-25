@@ -428,24 +428,26 @@ Radiation::dealloc_buffers ()
 void
 Radiation::mf_to_kokkos_buffers (Vector<MultiFab*>& lsm_input_ptrs)
 {
-    // Expose for device
-    auto r_lay_d  = r_lay;
-    auto p_lay_d  = p_lay;
-    auto t_lay_d  = t_lay;
-    auto z_del_d  = z_del;
-    auto qv_lay_d = qv_lay;
-    auto qc_lay_d = qc_lay;
-    auto qi_lay_d = qi_lay;
-    auto cldfrac_tot_d = cldfrac_tot;
-    auto lwp_d = lwp;
-    auto iwp_d = iwp;
-    auto eff_radius_qc_d = eff_radius_qc;
-    auto eff_radius_qi_d = eff_radius_qi;
-    auto p_lev_d = p_lev;
-    auto t_lev_d = t_lev;
-    auto lat_d = lat;
-    auto lon_d = lon;
-    auto t_sfc_d = t_sfc;
+    Table2D<Real,Order::C> r_lay_tab(r_lay.data(), {0,0}, {static_cast<int>(r_lay.extent(0)),static_cast<int>(r_lay.extent(1))});
+    Table2D<Real,Order::C> p_lay_tab(p_lay.data(), {0,0}, {static_cast<int>(p_lay.extent(0)),static_cast<int>(p_lay.extent(1))});
+    Table2D<Real,Order::C> t_lay_tab(t_lay.data(), {0,0}, {static_cast<int>(t_lay.extent(0)),static_cast<int>(t_lay.extent(1))});
+    Table2D<Real,Order::C> z_del_tab(z_del.data(), {0,0}, {static_cast<int>(z_del.extent(0)),static_cast<int>(z_del.extent(1))});
+    Table2D<Real,Order::C> qv_lay_tab(qv_lay.data(), {0,0}, {static_cast<int>(qv_lay.extent(0)),static_cast<int>(qv_lay.extent(1))});
+    Table2D<Real,Order::C> qc_lay_tab(qc_lay.data(), {0,0}, {static_cast<int>(qc_lay.extent(0)),static_cast<int>(qc_lay.extent(1))});
+    Table2D<Real,Order::C> qi_lay_tab(qi_lay.data(), {0,0}, {static_cast<int>(qi_lay.extent(0)),static_cast<int>(qi_lay.extent(1))});
+    Table2D<Real,Order::C> cldfrac_tot_tab(cldfrac_tot.data(), {0,0}, {static_cast<int>(cldfrac_tot.extent(0)),static_cast<int>(cldfrac_tot.extent(1))});
+
+    Table2D<Real,Order::C> lwp_tab(lwp.data(), {0,0}, {static_cast<int>(lwp.extent(0)),static_cast<int>(lwp.extent(1))});
+    Table2D<Real,Order::C> iwp_tab(iwp.data(), {0,0}, {static_cast<int>(iwp.extent(0)),static_cast<int>(iwp.extent(1))});
+    Table2D<Real,Order::C> eff_radius_qc_tab(eff_radius_qc.data(), {0,0}, {static_cast<int>(eff_radius_qc.extent(0)),static_cast<int>(eff_radius_qc.extent(1))});
+    Table2D<Real,Order::C> eff_radius_qi_tab(eff_radius_qi.data(), {0,0}, {static_cast<int>(eff_radius_qi.extent(0)),static_cast<int>(eff_radius_qi.extent(1))});
+
+    Table2D<Real,Order::C> p_lev_tab(p_lev.data(), {0,0}, {static_cast<int>(p_lev.extent(0)),static_cast<int>(p_lev.extent(1))});
+    Table2D<Real,Order::C> t_lev_tab(t_lev.data(), {0,0}, {static_cast<int>(t_lev.extent(0)),static_cast<int>(t_lev.extent(1))});
+
+    Table1D<Real> lat_tab(lat.data(), {0}, {static_cast<int>(lat.extent(0))});
+    Table1D<Real> lon_tab(lon.data(), {0}, {static_cast<int>(lon.extent(0))});
+    Table1D<Real> t_sfc_tab(t_sfc.data(), {0}, {static_cast<int>(t_sfc.extent(0))});
 
     bool moist = m_moist;
     bool ice   = m_ice;
@@ -458,6 +460,7 @@ Radiation::mf_to_kokkos_buffers (Vector<MultiFab*>& lsm_input_ptrs)
     Real cons_lat = m_lat_cons;
     Real cons_lon = m_lon_cons;
     Real rad_t_sfc = m_rad_t_sfc;
+
     for (MFIter mfi(*m_cons_in); mfi.isValid(); ++mfi) {
         const auto& vbx  = mfi.validbox();
         const int nx     = vbx.length(0);
@@ -493,31 +496,30 @@ Radiation::mf_to_kokkos_buffers (Vector<MultiFab*>& lsm_input_ptrs)
             Real qv_avg = 0.5 * (qv + qv_lo);
 
             // Views at CC
-            r_lay_d(icol,ilay) = r;
-            p_lay_d(icol,ilay) = getPgivenRTh(rt, qv);
-            t_lay_d(icol,ilay) = getTgivenRandRTh(r, rt, qv);
-            z_del_d(icol,ilay) = (z_arr) ? 0.25 * ( (z_arr(i  ,j  ,k+1) - z_arr(i  ,j  ,k))
-                                                  + (z_arr(i+1,j  ,k+1) - z_arr(i+1,j  ,k))
-                                                  + (z_arr(i  ,j+1,k+1) - z_arr(i  ,j+1,k))
-                                                  + (z_arr(i+1,j+1,k+1) - z_arr(i+1,j+1,k)) ) : dz;
-            qv_lay_d(icol,ilay) = qv;
-            qc_lay_d(icol,ilay) = qc;
-            qi_lay_d(icol,ilay) = qi;
-            cldfrac_tot_d(icol,ilay) = ((qc+qi)>0.0) ? 1. : 0.;
+            r_lay_tab(icol,ilay) = r;
+
+            p_lay_tab(icol,ilay) = getPgivenRTh(rt, qv);
+            t_lay_tab(icol,ilay) = getTgivenRandRTh(r, rt, qv);
+            z_del_tab(icol,ilay) = (z_arr) ? 0.25 * ( (z_arr(i  ,j  ,k+1) - z_arr(i  ,j  ,k))
+                                                    + (z_arr(i+1,j  ,k+1) - z_arr(i+1,j  ,k))
+                                                    + (z_arr(i  ,j+1,k+1) - z_arr(i  ,j+1,k))
+                                                    + (z_arr(i+1,j+1,k+1) - z_arr(i+1,j+1,k)) ) : dz;
+            qv_lay_tab(icol,ilay) = qv;
+            qc_lay_tab(icol,ilay) = qc;
+            qi_lay_tab(icol,ilay) = qi;
+            cldfrac_tot_tab(icol,ilay) = ((qc+qi)>0.0) ? 1. : 0.;
 
             // NOTE: These are populated in 'mixing_ratio_to_cloud_mass'
-            lwp_d(icol,ilay) = 0.0;
-            iwp_d(icol,ilay) = 0.0;
+            lwp_tab(icol,ilay) = 0.0;
+            iwp_tab(icol,ilay) = 0.0;
 
             // NOTE: These would be populated from P3 (we use the constants in p3_main_impl.hpp)
-            //eff_radius_qc_d(icol,ilay) = (qc>0.0) ? 10.0e-6 : 0.0;
-            //eff_radius_qi_d(icol,ilay) = (qi>0.0) ? 25.0e-6 : 0.0;
-            eff_radius_qc_d(icol,ilay) = 10.0e-6;
-            eff_radius_qi_d(icol,ilay) = 25.0e-6;
+            eff_radius_qc_tab(icol,ilay) = (qc>0.0) ? 10.0e-6 : 0.0;
+            eff_radius_qi_tab(icol,ilay) = (qi>0.0) ? 25.0e-6 : 0.0;
 
             // Buffers on z-faces (nlay+1)
-            p_lev_d(icol,ilay) = getPgivenRTh(rt_avg, qv_avg);
-            t_lev_d(icol,ilay) = getTgivenRandRTh(r_avg, rt_avg, qv_avg);
+            p_lev_tab(icol,ilay) = getPgivenRTh(rt_avg, qv_avg);
+            t_lev_tab(icol,ilay) = getTgivenRandRTh(r_avg, rt_avg, qv_avg);
             if (ilay==(nlay-1)) {
                 Real r_hi  = cons_arr(i,j,k+1,Rho_comp);
                 Real rt_hi = cons_arr(i,j,k+1,RhoTheta_comp);
@@ -525,14 +527,14 @@ Radiation::mf_to_kokkos_buffers (Vector<MultiFab*>& lsm_input_ptrs)
                 r_avg  = 0.5 * (r  + r_hi);
                 rt_avg = 0.5 * (rt + rt_hi);
                 qv_avg = 0.5 * (qv + qv_hi);
-                p_lev_d(icol,ilay+1) = getPgivenRTh(rt_avg, qv_avg);
-                t_lev_d(icol,ilay+1) = getTgivenRandRTh(r_avg, rt_avg, qv_avg);
+                p_lev_tab(icol,ilay+1) = getPgivenRTh(rt_avg, qv_avg);
+                t_lev_tab(icol,ilay+1) = getTgivenRandRTh(r_avg, rt_avg, qv_avg);
             }
 
             // 1D data structures
             if (k==0) {
-                lat_d(icol) = (has_lat) ? lat_arr(i,j,0) : cons_lat;
-                lon_d(icol) = (has_lon) ? lon_arr(i,j,0) : cons_lon;
+                lat_tab(icol) = (has_lat) ? lat_arr(i,j,0) : cons_lat;
+                lon_tab(icol) = (has_lon) ? lon_arr(i,j,0) : cons_lon;
             }
 
         });
@@ -593,7 +595,7 @@ Radiation::mf_to_kokkos_buffers (Vector<MultiFab*>& lsm_input_ptrs)
     Kokkos::parallel_for(Kokkos::RangePolicy(0, ncol),
                          KOKKOS_LAMBDA (int icol)
     {
-        t_lev_d(icol,0) = t_sfc_d(icol);
+        t_lev_tab(icol,0) = t_sfc_tab(icol);
     });
 }
 
@@ -604,7 +606,22 @@ Radiation::kokkos_buffers_to_mf (Vector<MultiFab*>& lsm_output_ptrs)
     // Heating rate, fluxes, zenith, lsm ptrs
     Vector<real2d_k> rrtmgp_out_vars = {sw_flux_dn, lw_flux_dn};
 
+    Table2D<Real,Order::C> p_lay_tab(p_lay.data(), {0,0}, {static_cast<int>(p_lay.extent(0)),static_cast<int>(p_lay.extent(1))});
+    Table2D<Real,Order::C> sw_heating_tab(sw_heating.data(), {0,0}, {static_cast<int>(sw_heating.extent(0)),static_cast<int>(sw_heating.extent(1))});
+    Table2D<Real,Order::C> lw_heating_tab(lw_heating.data(), {0,0}, {static_cast<int>(lw_heating.extent(0)),static_cast<int>(lw_heating.extent(1))});
+    Table2D<Real,Order::C> sw_flux_up_tab(sw_flux_up.data(), {0,0}, {static_cast<int>(sw_flux_up.extent(0)),static_cast<int>(sw_flux_up.extent(1))});
+    Table2D<Real,Order::C> sw_flux_dn_tab(sw_flux_dn.data(), {0,0}, {static_cast<int>(sw_flux_dn.extent(0)),static_cast<int>(sw_flux_dn.extent(1))});
+    Table2D<Real,Order::C> lw_flux_up_tab(lw_flux_up.data(), {0,0}, {static_cast<int>(lw_flux_up.extent(0)),static_cast<int>(lw_flux_up.extent(1))});
+    Table2D<Real,Order::C> lw_flux_dn_tab(lw_flux_dn.data(), {0,0}, {static_cast<int>(lw_flux_dn.extent(0)),static_cast<int>(lw_flux_dn.extent(1))});
+
+    Table1D<Real> sfc_flux_dir_vis_tab(sfc_flux_dir_vis.data(), {0}, {static_cast<int>(sfc_flux_dir_vis.extent(0))});
+    Table1D<Real> sfc_flux_dir_nir_tab(sfc_flux_dir_nir.data(), {0}, {static_cast<int>(sfc_flux_dir_nir.extent(0))});
+    Table1D<Real> sfc_flux_dif_vis_tab(sfc_flux_dif_vis.data(), {0}, {static_cast<int>(sfc_flux_dif_vis.extent(0))});
+    Table1D<Real> sfc_flux_dif_nir_tab(sfc_flux_dif_nir.data(), {0}, {static_cast<int>(sfc_flux_dif_nir.extent(0))});
+    Table1D<Real>              mu0_tab(mu0.data(),              {0}, {static_cast<int>(mu0.extent(0))});
+
     // Expose for device
+<<<<<<< HEAD
     auto sw_heating_d = sw_heating;
     auto lw_heating_d = lw_heating;
     auto p_lay_d = p_lay;
@@ -614,6 +631,8 @@ Radiation::kokkos_buffers_to_mf (Vector<MultiFab*>& lsm_output_ptrs)
     auto sfc_flux_dif_nir_d = sfc_flux_dif_nir;
     auto lw_flux_dn_d = lw_flux_dn;
     auto mu0_d = mu0;
+=======
+>>>>>>> d37001fe7d69892ba49c02fd6844d9f4a48eafe7
 
     for (MFIter mfi(*m_cons_in); mfi.isValid(); ++mfi) {
         const auto& vbx      = mfi.validbox();
@@ -630,13 +649,22 @@ Radiation::kokkos_buffers_to_mf (Vector<MultiFab*>& lsm_output_ptrs)
             const int ilay = k;
 
             // Temperature heating rate for SW and LW
-            q_arr(i,j,k,0) = sw_heating_d(icol,ilay);
-            q_arr(i,j,k,1) = lw_heating_d(icol,ilay);
+            q_arr(i,j,k,0) = sw_heating_tab(icol,ilay);
+            q_arr(i,j,k,1) = lw_heating_tab(icol,ilay);
 
             // Convert the dT/dz to dTheta/dz
-            Real iexner = 1./getExnergivenP(Real(p_lay_d(icol,ilay)), R_d/Cp_d);
+            Real iexner = 1./getExnergivenP(Real(p_lay_tab(icol,ilay)), R_d/Cp_d);
             q_arr(i,j,k,0) *= iexner;
             q_arr(i,j,k,1) *= iexner;
+<<<<<<< HEAD
+=======
+
+            // Populate the fluxes
+            f_arr(i,j,k,0) = sw_flux_up_tab(icol,ilay);
+            f_arr(i,j,k,1) = sw_flux_dn_tab(icol,ilay);
+            f_arr(i,j,k,2) = lw_flux_up_tab(icol,ilay);
+            f_arr(i,j,k,3) = lw_flux_dn_tab(icol,ilay);
+>>>>>>> d37001fe7d69892ba49c02fd6844d9f4a48eafe7
         });
         if (m_lsm_fluxes) {
             const Array4<Real>& lsm_arr =  m_lsm_fluxes->array(mfi);
@@ -646,17 +674,17 @@ Radiation::kokkos_buffers_to_mf (Vector<MultiFab*>& lsm_output_ptrs)
                 const int icol = (j-jmin)*nx + (i-imin) + offset;
 
                 // SW fluxes for LSM
-                lsm_arr(i,j,k,0) = sfc_flux_dir_vis_d(icol);
-                lsm_arr(i,j,k,1) = sfc_flux_dir_nir_d(icol);
-                lsm_arr(i,j,k,2) = sfc_flux_dif_vis_d(icol);
-                lsm_arr(i,j,k,3) = sfc_flux_dif_nir_d(icol);
+                lsm_arr(i,j,k,0) = sfc_flux_dir_vis_tab(icol);
+                lsm_arr(i,j,k,1) = sfc_flux_dir_nir_tab(icol);
+                lsm_arr(i,j,k,2) = sfc_flux_dif_vis_tab(icol);
+                lsm_arr(i,j,k,3) = sfc_flux_dif_nir_tab(icol);
 
                 // Net SW flux for LSM
-                lsm_arr(i,j,k,4) = sfc_flux_dir_vis_d(icol) + sfc_flux_dir_nir_d(icol)
-                                 + sfc_flux_dif_vis_d(icol) + sfc_flux_dif_nir_d(icol);
+                lsm_arr(i,j,k,4) = sfc_flux_dir_vis_tab(icol) + sfc_flux_dir_nir_tab(icol)
+                                 + sfc_flux_dif_vis_tab(icol) + sfc_flux_dif_nir_tab(icol);
 
                 // LW flux for LSM (at bottom surface)
-                lsm_arr(i,j,k,5) = lw_flux_dn_d(icol,0);
+                lsm_arr(i,j,k,5) = lw_flux_dn_tab(icol,0);
             });
         }
         if (m_lsm_zenith) {
@@ -667,7 +695,7 @@ Radiation::kokkos_buffers_to_mf (Vector<MultiFab*>& lsm_output_ptrs)
                 const int icol = (j-jmin)*nx + (i-imin) + offset;
 
                 // export cosine zenith angle for LSM
-                lsm_zenith_arr(i,j,k) = mu0_d(icol);
+                lsm_zenith_arr(i,j,k) = mu0_tab(icol);
             });
         }
         for (int ivar(0); ivar<lsm_output_ptrs.size(); ivar++) {
@@ -680,7 +708,7 @@ Radiation::kokkos_buffers_to_mf (Vector<MultiFab*>& lsm_output_ptrs)
                         const int icol   = (j-jmin)*nx + (i-imin) + offset;
 
                         // export the desired variable at surface
-                        lsm_out_arr(i,j,k) = mu0_d(icol);
+                        lsm_out_arr(i,j,k) = mu0_tab(icol);
                     });
                 } else {
                     auto rrtmgp_for_fill = rrtmgp_out_vars[ivar-1];
@@ -701,12 +729,11 @@ Radiation::kokkos_buffers_to_mf (Vector<MultiFab*>& lsm_output_ptrs)
 void
 Radiation::write_rrtmgp_fluxes ()
 {
-    // Expose for device
-    auto sw_flux_up_d = sw_flux_up;
-    auto sw_flux_dn_d = sw_flux_dn;
-    auto sw_flux_dn_dir_d = sw_flux_dn_dir;
-    auto lw_flux_up_d = lw_flux_up;
-    auto lw_flux_dn_d = lw_flux_dn;
+    Table2D<Real,Order::C> sw_flux_up_tab(sw_flux_up.data(), {0,0}, {static_cast<int>(sw_flux_up.extent(0)),static_cast<int>(sw_flux_up.extent(1))});
+    Table2D<Real,Order::C> sw_flux_dn_tab(sw_flux_dn.data(), {0,0}, {static_cast<int>(sw_flux_dn.extent(0)),static_cast<int>(sw_flux_dn.extent(1))});
+    Table2D<Real,Order::C> sw_flux_dn_dir_tab(sw_flux_dn_dir.data(), {0,0}, {static_cast<int>(sw_flux_dn_dir.extent(0)),static_cast<int>(sw_flux_dn_dir.extent(1))});
+    Table2D<Real,Order::C> lw_flux_up_tab(lw_flux_up.data(), {0,0}, {static_cast<int>(lw_flux_up.extent(0)),static_cast<int>(lw_flux_up.extent(1))});
+    Table2D<Real,Order::C> lw_flux_dn_tab(lw_flux_dn.data(), {0,0}, {static_cast<int>(lw_flux_dn.extent(0)),static_cast<int>(lw_flux_dn.extent(1))});
 
     int n_fluxes = 5;
     MultiFab mf_flux(m_cons_in->boxArray(), m_cons_in->DistributionMap(), n_fluxes, 0);
@@ -725,11 +752,11 @@ Radiation::write_rrtmgp_fluxes ()
             const int ilay = k;
 
             // SW and LW fluxes
-            dst_arr(i,j,k,0) = sw_flux_up_d(icol,ilay);
-            dst_arr(i,j,k,1) = sw_flux_dn_d(icol,ilay);
-            dst_arr(i,j,k,2) = sw_flux_dn_dir_d(icol,ilay);
-            dst_arr(i,j,k,3) = lw_flux_up_d(icol,ilay);
-            dst_arr(i,j,k,4) = lw_flux_dn_d(icol,ilay);
+            dst_arr(i,j,k,0) = sw_flux_up_tab(icol,ilay);
+            dst_arr(i,j,k,1) = sw_flux_dn_tab(icol,ilay);
+            dst_arr(i,j,k,2) = sw_flux_dn_dir_tab(icol,ilay);
+            dst_arr(i,j,k,3) = lw_flux_up_tab(icol,ilay);
+            dst_arr(i,j,k,4) = lw_flux_dn_tab(icol,ilay);
         });
    }
 
@@ -742,31 +769,48 @@ Radiation::write_rrtmgp_fluxes ()
 
 void Radiation::populateDatalogMF ()
 {
-    // Expose for device
-    auto sw_flux_up_d = sw_flux_up;
-    auto sw_flux_dn_d = sw_flux_dn;
-    auto sw_flux_dn_dir_d = sw_flux_dn_dir;
-    auto lw_flux_up_d = lw_flux_up;
-    auto lw_flux_dn_d = lw_flux_dn;
-    auto mu0_d = mu0;
-    auto sw_clrsky_heating_d = sw_clrsky_heating;
-    auto lw_clrsky_heating_d = lw_clrsky_heating;
+    Table2D<Real,Order::C> sw_flux_up_tab(sw_flux_up.data(), {0,0}, {static_cast<int>(sw_flux_up.extent(0)),static_cast<int>(sw_flux_up.extent(1))});
+    Table2D<Real,Order::C> sw_flux_dn_tab(sw_flux_dn.data(), {0,0}, {static_cast<int>(sw_flux_dn.extent(0)),static_cast<int>(sw_flux_dn.extent(1))});
+    Table2D<Real,Order::C> sw_flux_dn_dir_tab(sw_flux_dn_dir.data(), {0,0}, {static_cast<int>(sw_flux_dn_dir.extent(0)),static_cast<int>(sw_flux_dn_dir.extent(1))});
+    Table2D<Real,Order::C> lw_flux_up_tab(lw_flux_up.data(), {0,0}, {static_cast<int>(lw_flux_up.extent(0)),static_cast<int>(lw_flux_up.extent(1))});
+    Table2D<Real,Order::C> lw_flux_dn_tab(lw_flux_dn.data(), {0,0}, {static_cast<int>(lw_flux_dn.extent(0)),static_cast<int>(lw_flux_dn.extent(1))});
 
-    auto sw_clrsky_flux_up_d = sw_clrsky_flux_up;
-    auto sw_clrsky_flux_dn_d = sw_clrsky_flux_dn;
-    auto sw_clrsky_flux_dn_dir_d = sw_clrsky_flux_dn_dir;
-    auto lw_clrsky_flux_up_d = lw_clrsky_flux_up;
-    auto lw_clrsky_flux_dn_d = lw_clrsky_flux_dn;
-    auto sw_clnsky_flux_up_d = sw_clnsky_flux_up;
-    auto sw_clnsky_flux_dn_d = sw_clnsky_flux_dn;
-    auto sw_clnsky_flux_dn_dir_d = sw_clnsky_flux_dn_dir;
-    auto lw_clnsky_flux_up_d = lw_clnsky_flux_up;
-    auto lw_clnsky_flux_dn_d = lw_clnsky_flux_dn;
-    auto sw_clnclrsky_flux_up_d = sw_clnclrsky_flux_up;
-    auto sw_clnclrsky_flux_dn_d = sw_clnclrsky_flux_dn;
-    auto sw_clnclrsky_flux_dn_dir_d = sw_clnclrsky_flux_dn_dir;
-    auto lw_clnclrsky_flux_up_d = lw_clnclrsky_flux_up;
-    auto lw_clnclrsky_flux_dn_d = lw_clnclrsky_flux_dn;
+    Table2D<Real,Order::C> sw_clrsky_flux_up_tab(sw_clrsky_flux_up.data(), {0,0},
+                                                 {static_cast<int>(sw_clrsky_flux_up.extent(0)),static_cast<int>(sw_clrsky_flux_up.extent(1))});
+    Table2D<Real,Order::C> sw_clrsky_flux_dn_tab(sw_clrsky_flux_dn.data(), {0,0},
+                                                 {static_cast<int>(sw_clrsky_flux_dn.extent(0)),static_cast<int>(sw_clrsky_flux_dn.extent(1))});
+    Table2D<Real,Order::C> sw_clrsky_flux_dn_dir_tab(sw_clrsky_flux_dn_dir.data(), {0,0},
+                                                 {static_cast<int>(sw_clrsky_flux_dn_dir.extent(0)),static_cast<int>(sw_clrsky_flux_dn_dir.extent(1))});
+    Table2D<Real,Order::C> lw_clrsky_flux_up_tab(lw_clrsky_flux_up.data(), {0,0},
+                                                 {static_cast<int>(lw_clrsky_flux_up.extent(0)),static_cast<int>(lw_clrsky_flux_up.extent(1))});
+    Table2D<Real,Order::C> lw_clrsky_flux_dn_tab(lw_clrsky_flux_dn.data(), {0,0},
+                                                 {static_cast<int>(lw_clrsky_flux_dn.extent(0)),static_cast<int>(lw_clrsky_flux_dn.extent(1))});
+    Table2D<Real,Order::C> sw_clrsky_heating_tab(sw_clrsky_heating.data(), {0,0},
+                                                 {static_cast<int>(sw_clrsky_heating.extent(0)),static_cast<int>(sw_clrsky_heating.extent(1))});
+    Table2D<Real,Order::C> lw_clrsky_heating_tab(lw_clrsky_heating.data(), {0,0},
+                                                 {static_cast<int>(lw_clrsky_heating.extent(0)),static_cast<int>(lw_clrsky_heating.extent(1))});
+    Table2D<Real,Order::C> sw_clnsky_flux_up_tab(sw_clnsky_flux_up.data(), {0,0},
+                                                 {static_cast<int>(sw_clnsky_flux_up.extent(0)),static_cast<int>(sw_clnsky_flux_up.extent(1))});
+    Table2D<Real,Order::C> sw_clnsky_flux_dn_tab(sw_clnsky_flux_dn.data(), {0,0},
+                                                 {static_cast<int>(sw_clnsky_flux_dn.extent(0)),static_cast<int>(sw_clnsky_flux_dn.extent(1))});
+    Table2D<Real,Order::C> sw_clnsky_flux_dn_dir_tab(sw_clnsky_flux_dn_dir.data(), {0,0},
+                                                 {static_cast<int>(sw_clnsky_flux_dn_dir.extent(0)),static_cast<int>(sw_clnsky_flux_dn_dir.extent(1))});
+    Table2D<Real,Order::C> lw_clnsky_flux_up_tab(lw_clnsky_flux_up.data(), {0,0},
+                                                 {static_cast<int>(lw_clnsky_flux_up.extent(0)),static_cast<int>(lw_clnsky_flux_up.extent(1))});
+    Table2D<Real,Order::C> lw_clnsky_flux_dn_tab(lw_clnsky_flux_dn.data(), {0,0},
+                                                 {static_cast<int>(lw_clnsky_flux_dn.extent(0)),static_cast<int>(lw_clnsky_flux_dn.extent(1))});
+    Table2D<Real,Order::C> sw_clnclrsky_flux_up_tab(sw_clnclrsky_flux_up.data(), {0,0},
+                                                 {static_cast<int>(sw_clnclrsky_flux_up.extent(0)),static_cast<int>(sw_clnclrsky_flux_up.extent(1))});
+    Table2D<Real,Order::C> sw_clnclrsky_flux_dn_tab(sw_clnclrsky_flux_dn.data(), {0,0},
+                                                 {static_cast<int>(sw_clnclrsky_flux_dn.extent(0)),static_cast<int>(sw_clnclrsky_flux_dn.extent(1))});
+    Table2D<Real,Order::C> sw_clnclrsky_flux_dn_dir_tab(sw_clnclrsky_flux_dn_dir.data(), {0,0},
+                                                 {static_cast<int>(sw_clnclrsky_flux_dn_dir.extent(0)),static_cast<int>(sw_clnclrsky_flux_dn_dir.extent(1))});
+    Table2D<Real,Order::C> lw_clnclrsky_flux_up_tab(lw_clnclrsky_flux_up.data(), {0,0},
+                                                 {static_cast<int>(lw_clnclrsky_flux_up.extent(0)),static_cast<int>(lw_clnclrsky_flux_up.extent(1))});
+    Table2D<Real,Order::C> lw_clnclrsky_flux_dn_tab(lw_clnclrsky_flux_dn.data(), {0,0},
+                                                 {static_cast<int>(lw_clnclrsky_flux_dn.extent(0)),static_cast<int>(lw_clnclrsky_flux_dn.extent(1))});
+
+    Table1D<Real>              mu0_tab(mu0.data(),              {0}, {static_cast<int>(mu0.extent(0))});
 
     auto extra_clnsky_diag = m_extra_clnsky_diag;
     auto extra_clnclrsky_diag = m_extra_clnclrsky_diag;
@@ -789,41 +833,41 @@ void Radiation::populateDatalogMF ()
             dst_arr(i,j,k,1) = q_arr(i, j, k, 1);
 
             // SW and LW fluxes
-            dst_arr(i,j,k,2) = sw_flux_up_d(icol,ilay);
-            dst_arr(i,j,k,3) = sw_flux_dn_d(icol,ilay);
-            dst_arr(i,j,k,4) = sw_flux_dn_dir_d(icol,ilay);
-            dst_arr(i,j,k,5) = lw_flux_up_d(icol,ilay);
-            dst_arr(i,j,k,6) = lw_flux_dn_d(icol,ilay);
+            dst_arr(i,j,k,2) = sw_flux_up_tab(icol,ilay);
+            dst_arr(i,j,k,3) = sw_flux_dn_tab(icol,ilay);
+            dst_arr(i,j,k,4) = sw_flux_dn_dir_tab(icol,ilay);
+            dst_arr(i,j,k,5) = lw_flux_up_tab(icol,ilay);
+            dst_arr(i,j,k,6) = lw_flux_dn_tab(icol,ilay);
 
             // Cosine zenith angle
-            dst_arr(i,j,k,7) = mu0_d(icol);
+            dst_arr(i,j,k,7) = mu0_tab(icol);
 
             // Clear sky heating rates and fluxes:
-            dst_arr(i,j,k,8) = sw_clrsky_heating_d(icol, ilay);
-            dst_arr(i,j,k,9) = lw_clrsky_heating_d(icol, ilay);
+            dst_arr(i,j,k,8) = sw_clrsky_heating_tab(icol, ilay);
+            dst_arr(i,j,k,9) = lw_clrsky_heating_tab(icol, ilay);
 
-            dst_arr(i,j,k,10) = sw_clrsky_flux_up_d(icol,ilay);
-            dst_arr(i,j,k,11) = sw_clrsky_flux_dn_d(icol,ilay);
-            dst_arr(i,j,k,12) = sw_clrsky_flux_dn_dir_d(icol,ilay);
-            dst_arr(i,j,k,13) = lw_clrsky_flux_up_d(icol,ilay);
-            dst_arr(i,j,k,14) = lw_clrsky_flux_dn_d(icol,ilay);
+            dst_arr(i,j,k,10) = sw_clrsky_flux_up_tab(icol,ilay);
+            dst_arr(i,j,k,11) = sw_clrsky_flux_dn_tab(icol,ilay);
+            dst_arr(i,j,k,12) = sw_clrsky_flux_dn_dir_tab(icol,ilay);
+            dst_arr(i,j,k,13) = lw_clrsky_flux_up_tab(icol,ilay);
+            dst_arr(i,j,k,14) = lw_clrsky_flux_dn_tab(icol,ilay);
 
             // Clean sky fluxes:
             if (extra_clnsky_diag) {
-                dst_arr(i,j,k,15) = sw_clnsky_flux_up_d(icol,ilay);
-                dst_arr(i,j,k,16) = sw_clnsky_flux_dn_d(icol,ilay);
-                dst_arr(i,j,k,17) = sw_clnsky_flux_dn_dir_d(icol,ilay);
-                dst_arr(i,j,k,18) = lw_clnsky_flux_up_d(icol,ilay);
-                dst_arr(i,j,k,19) = lw_clnsky_flux_dn_d(icol,ilay);
+                dst_arr(i,j,k,15) = sw_clnsky_flux_up_tab(icol,ilay);
+                dst_arr(i,j,k,16) = sw_clnsky_flux_dn_tab(icol,ilay);
+                dst_arr(i,j,k,17) = sw_clnsky_flux_dn_dir_tab(icol,ilay);
+                dst_arr(i,j,k,18) = lw_clnsky_flux_up_tab(icol,ilay);
+                dst_arr(i,j,k,19) = lw_clnsky_flux_dn_tab(icol,ilay);
             }
 
             // Clean-clear sky fluxes:
             if (extra_clnclrsky_diag) {
-                dst_arr(i,j,k,20) = sw_clnclrsky_flux_up_d(icol,ilay);
-                dst_arr(i,j,k,21) = sw_clnclrsky_flux_dn_d(icol,ilay);
-                dst_arr(i,j,k,22) = sw_clnclrsky_flux_dn_dir_d(icol,ilay);
-                dst_arr(i,j,k,23) = lw_clnclrsky_flux_up_d(icol,ilay);
-                dst_arr(i,j,k,24) = lw_clnclrsky_flux_dn_d(icol,ilay);
+                dst_arr(i,j,k,20) = sw_clnclrsky_flux_up_tab(icol,ilay);
+                dst_arr(i,j,k,21) = sw_clnclrsky_flux_dn_tab(icol,ilay);
+                dst_arr(i,j,k,22) = sw_clnclrsky_flux_dn_dir_tab(icol,ilay);
+                dst_arr(i,j,k,23) = lw_clnclrsky_flux_up_tab(icol,ilay);
+                dst_arr(i,j,k,24) = lw_clnclrsky_flux_dn_tab(icol,ilay);
             }
         });
    }
@@ -1090,13 +1134,13 @@ Radiation::run_impl ()
     rrtmgp::mixing_ratio_to_cloud_mass(qi_lay, cldfrac_tot, r_lay, z_del, iwp);
 
     // Convert to g/m2 (needed by RRTMGP)
-    auto lwp_d = lwp;
-    auto iwp_d = iwp;
+    Table2D<Real,Order::C> lwp_tab(lwp.data(), {0,0}, {static_cast<int>(lwp.extent(0)),static_cast<int>(lwp.extent(1))});
+    Table2D<Real,Order::C> iwp_tab(iwp.data(), {0,0}, {static_cast<int>(iwp.extent(0)),static_cast<int>(iwp.extent(1))});
     Kokkos::parallel_for(Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0, 0}, {ncol, nlay}),
                          KOKKOS_LAMBDA (int icol, int ilay)
     {
-        lwp_d(icol,ilay) *= 1.e3;
-        iwp_d(icol,ilay) *= 1.e3;
+        lwp_tab(icol,ilay) *= 1.e3;
+        iwp_tab(icol,ilay) *= 1.e3;
     });
 
     // Expand surface_albedos along nswbands.
@@ -1215,13 +1259,16 @@ Radiation::run_impl ()
 
     // Compute surface fluxes
     const int kbot = 0;
-    auto sw_bnd_flux_dif_d = sw_bnd_flux_dif;
-    auto sw_bnd_flux_dn_d  = sw_bnd_flux_dn;
-    auto sw_bnd_flux_dir_d = sw_bnd_flux_dir;
+    Table3D<Real,Order::C> sw_bnd_flux_dif_tab(sw_bnd_flux_dif.data(), {0,0,0},
+                           {static_cast<int>(sw_bnd_flux_dif.extent(0)),static_cast<int>(sw_bnd_flux_dif.extent(1)),static_cast<int>(sw_bnd_flux_dif.extent(2))});
+    Table3D<Real,Order::C> sw_bnd_flux_dn_tab(sw_bnd_flux_dn.data(), {0,0,0},
+                           {static_cast<int>(sw_bnd_flux_dn.extent(0)),static_cast<int>(sw_bnd_flux_dn.extent(1)),static_cast<int>(sw_bnd_flux_dn.extent(2))});
+    Table3D<Real,Order::C> sw_bnd_flux_dir_tab(sw_bnd_flux_dir.data(), {0,0,0},
+                           {static_cast<int>(sw_bnd_flux_dir.extent(0)),static_cast<int>(sw_bnd_flux_dir.extent(1)),static_cast<int>(sw_bnd_flux_dir.extent(2))});
     Kokkos::parallel_for(Kokkos::MDRangePolicy<Kokkos::Rank<3>>({0, 0, 0}, {ncol, nlay+1, nswbands}),
                          KOKKOS_LAMBDA (int icol, int ilay, int ibnd)
     {
-        sw_bnd_flux_dif_d(icol,ilay,ibnd) = sw_bnd_flux_dn_d(icol,ilay,ibnd) - sw_bnd_flux_dir_d(icol,ilay,ibnd);
+        sw_bnd_flux_dif_tab(icol,ilay,ibnd) = sw_bnd_flux_dn_tab(icol,ilay,ibnd) - sw_bnd_flux_dir_tab(icol,ilay,ibnd);
     });
     rrtmgp::compute_broadband_surface_fluxes(ncol, kbot, nswbands,
                                              sw_bnd_flux_dir , sw_bnd_flux_dif ,

@@ -462,9 +462,16 @@ List of Parameters
 | Parameter                  | Definition           | Acceptable     | Default             |
 |                            |                      | Values         |                     |
 +============================+======================+================+=====================+
-| **erf.substepping_type**   | Should we substep in | "Implicit",    | "Implicit" if       |
-|                            | each RK stage?       | "Explicit",    | compressible,       |
-|                            |                      | "None"         | "None" if anelastic |
+| **erf.substepping_type**   | Should we substep in | "Implicit" or  | "Implicit" if       |
+|                            | each RK stage?       | "None"         | compressible,       |
+|                            |                      |                | "None" if anelastic |
++----------------------------+----------------------+----------------+---------------------+
+| **erf.vert_implicit**      | Do vertical implicit | Boolean        | false               |
+|                            | solve for diffusion  |                |                     |
+|                            | of u, v, and theta   |                |                     |
+|                            | with default         |                |                     |
+|                            | time-centering in    |                |                     |
+|                            | each stage           |                |                     |
 +----------------------------+----------------------+----------------+---------------------+
 | **erf.vert_implicit_fac**  | How much implicit    | Real >= 0      | 0.0, 0.0, 0.0       |
 |                            | vertical diffusion   | (explicit) and | (fully explicit)    |
@@ -1291,6 +1298,11 @@ List of Parameters
 | **erf.coriolis_3d**                 | Include z component in | true / false      | true                |
 |                                     | the Coriolis forcing   |                   |                     |
 +-------------------------------------+------------------------+-------------------+---------------------+
+| **erf.rayleigh_damping_type**       | Rayleigh damping       | "None",           | "SlowExplicit"      |
+|                                     | type                   | "SlowExplicit",   |                     |
+|                                     |                        | "FastExplicit"    |                     |
+|                                     |                        | "FastImplicit"    |                     |
++-------------------------------------+------------------------+-------------------+---------------------+
 | **erf.rayleigh_damp_U**             | Include explicit       | true / false      | false               |
 |                                     | Rayleigh damping in    |                   |                     |
 |                                     | the x-momentum equation|                   |                     |
@@ -1299,7 +1311,7 @@ List of Parameters
 |                                     | Rayleigh damping in    |                   |                     |
 |                                     | the y-momentum equation|                   |                     |
 +-------------------------------------+------------------------+-------------------+---------------------+
-| **erf.rayleigh_damp_W**             | Include explicit       | true / false      | false               |
+| **erf.rayleigh_damp_W**             | Include                | true / false      | false               |
 |                                     | Rayleigh damping in    |                   |                     |
 |                                     | the z-momentum equation|                   |                     |
 +-------------------------------------+------------------------+-------------------+---------------------+
@@ -1313,7 +1325,8 @@ List of Parameters
 |                                     | timescale              |                   |                     |
 +-------------------------------------+------------------------+-------------------+---------------------+
 | **erf.rayleigh_zdamp**              | Rayleigh damping       | Real              | 500.0               |
-|                                     | layer depth            |                   |                     |
+|                                     | layer depth measured   |                   |                     |
+|                                     | from the top of domain |                   |                     |
 +-------------------------------------+------------------------+-------------------+---------------------+
 | **erf.nudging_from_input_sounding** | Add momentum source    | true / false      | false               |
 |                                     | terms to nudge the     |                   |                     |
@@ -1408,9 +1421,36 @@ List of Parameters
 |                            | CFL for w-damping to be applied, |                   |             |
 |                            | if ``erf.w_damping`` is true     |                   |             |
 +----------------------------+----------------------------------+-------------------+-------------+
-| **erf.w_damping_coeff**    | w-damping coefficient (m/s)      | Real              | 0.3         |
+| **erf.w_damping_const**    | w-damping coefficient (m/s2)     | Real              | -1          |
++----------------------------+----------------------------------+-------------------+-------------+
+| **erf.w_damping_coeff**    | w-damping coefficient (-)        | Real              | -1          |
 +----------------------------+----------------------------------+-------------------+-------------+
 
+If ``erf.w_damping`` is true, then either ``erf.w_damping_const`` or ``erf.w_damping_coeff`` must
+be specified. For WRF-like damping, set ``erf.w_damping_const = 0.3`` to give
+
+.. math::
+
+   f_d = - \rho\,\text{sgn}(w)\,(C-C_{crit}) \cdot \gamma,
+
+where :math:`\gamma` is a constant damping coefficient with units of m/s2 and the advective Courant
+number is :math:`C = |w|\Delta t / \Delta z`.
+
+If ``erf.w_damping_coeff`` is specified instead, then
+
+.. math::
+
+   f_d = - \rho\,\text{sgn}(w)\,(|w|-w_{crit}) \cdot \frac{\alpha}{\Delta t},
+
+where :math:`\alpha` is a dimensionless damping factor and :math:`w_{crit} = C_{crit} \Delta z / \Delta t`.
+This is equivalent to:
+
+.. math::
+
+   f_d = - \rho\,\text{sgn}(w)\,(C-C_{crit}) \cdot \alpha \frac{\Delta z}{(\Delta t)^2}.
+
+This approach gives a damping coefficient that is sensitive to the vertical grid spacing and
+robustly damps towards the critical Courant number.
 
 
 Initialization
@@ -1844,6 +1884,8 @@ List of Parameters
 +-----------------------------+---------------------------+-------------------+------------+
 | Parameter                   | Definition                | Acceptable Values | Default    |
 +=============================+===========================+===================+============+
+| **erf.check_for_nans**      | Test solution for NaNs    |  int              | 0          |
++-----------------------------+---------------------------+-------------------+------------+
 | **amrex.fpe_trap_invalid**  | Raise errors for NaNs     |  0 / 1            | 0          |
 +-----------------------------+---------------------------+-------------------+------------+
 | **amrex.fpe_trap_zero**     | Raise errors for divide   |  0 / 1            | 0          |
