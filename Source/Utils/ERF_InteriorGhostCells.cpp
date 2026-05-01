@@ -820,6 +820,8 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
                 auto print_tend_for_side = [&](const Box& bx, const Array4<Real>& targ, const char* sname)
                 {
                     if (!bx.ok()) return;
+                    const bool dbg_nudge_exclude_x_corners_l = dbg_nudge_exclude_x_corners;
+                    const Real dbg_nudge_const_factor_l = dbg_nudge_const_factor;
                     const auto iv = bx.type();
                     const Real ioff = (iv[0] == 1) ? zero : myhalf;
                     const Real joff = (iv[1] == 1) ? zero : myhalf;
@@ -854,13 +856,13 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
                             Real eta_lo = (y < y_end ) ? (y_end  - y) / (y_end  - ProbLo[1]) : zero;
                             Real eta_hi = (y > y_strt) ? (y - y_strt) / (ProbHi[1] - y_strt) : zero;
                             Real eta    = amrex::max(eta_lo,eta_hi);
-                            if (dbg_nudge_exclude_x_corners && eta > zero) { apply = false; }
+                            if (dbg_nudge_exclude_x_corners_l && eta > zero) { apply = false; }
 
                             if (sname[2] == 'o') { // xlo
                                 Real x_end = ProbLo[0] + width * dx[0];
                                 Real xi = (x_end - x) / (x_end - ProbLo[0]);
                                 Factor = amrex::max(xi*xi, eta*eta);
-                                if (dbg_nudge_const_factor >= zero) { Factor = dbg_nudge_const_factor; }
+                                if (dbg_nudge_const_factor_l >= zero) { Factor = dbg_nudge_const_factor_l; }
                                 if (do_upwind) {
                                     int jju = amrex::min(amrex::max(j,dom_cc_lo.y),dom_cc_hi.y);
                                     int iiv = amrex::min(amrex::max(i,dom_cc_lo.x),dom_cc_hi.x);
@@ -874,7 +876,7 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
                                 Real x_strt = ProbHi[0] - width * dx[0];
                                 Real xi = (x - x_strt) / (ProbHi[0] - x_strt);
                                 Factor = amrex::max(xi*xi, eta*eta);
-                                if (dbg_nudge_const_factor >= zero) { Factor = dbg_nudge_const_factor; }
+                                if (dbg_nudge_const_factor_l >= zero) { Factor = dbg_nudge_const_factor_l; }
                                 if (do_upwind) {
                                     int jju = amrex::min(amrex::max(j,dom_cc_lo.y),dom_cc_hi.y);
                                     int iiv = amrex::min(amrex::max(i,dom_cc_lo.x),dom_cc_hi.x);
@@ -891,7 +893,7 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
                                 Real y_end = ProbLo[1] + width * dx[1];
                                 Real eta = (y_end - y) / (y_end - ProbLo[1]);
                                 Factor = eta*eta;
-                                if (dbg_nudge_const_factor >= zero) { Factor = dbg_nudge_const_factor; }
+                                if (dbg_nudge_const_factor_l >= zero) { Factor = dbg_nudge_const_factor_l; }
                                 if (do_upwind) {
                                     int iiv = amrex::min(amrex::max(i,dom_cc_lo.x+width),dom_cc_hi.x-width);
                                     apply = (v_ylo(iiv,dom_cc_lo.y,k) >= zero);
@@ -900,7 +902,7 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
                                 Real y_strt = ProbHi[1] - width * dx[1];
                                 Real eta = (y - y_strt) / (ProbHi[1] - y_strt);
                                 Factor = eta*eta;
-                                if (dbg_nudge_const_factor >= zero) { Factor = dbg_nudge_const_factor; }
+                                if (dbg_nudge_const_factor_l >= zero) { Factor = dbg_nudge_const_factor_l; }
                                 if (do_upwind) {
                                     int iiv = amrex::min(amrex::max(i,dom_cc_lo.x+width),dom_cc_hi.x-width);
                                     apply = (v_yhi(iiv,dom_cc_hi.y+1,k) >= zero);
