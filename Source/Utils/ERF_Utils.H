@@ -177,7 +177,7 @@ Time_Avg_Vel_atCC (const amrex::Real& dt,
  * @param[in] data_arr data array
  * @param[out] rhs_arr RHS array
  */
-AMREX_GPU_HOST
+AMREX_GPU_HOST_DEVICE
 AMREX_FORCE_INLINE
 amrex::Real
 realbdy_weight_shape (amrex::Real s,
