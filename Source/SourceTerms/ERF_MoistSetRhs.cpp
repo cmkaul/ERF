@@ -212,6 +212,7 @@ moist_set_rhs (const Geometry& geom,
 
     // Limiting offset
     int offset = width - 1;
+    const bool use_primitive_delta = dbg_realbdy_use_primitive_delta;
 
     // Populate with interpolation (protect from ghost cells)
     ParallelFor(tbx_xlo, tbx_xhi,
@@ -222,7 +223,7 @@ moist_set_rhs (const Geometry& geom,
         Real rho = new_cons(i,j,k,Rho_comp);
         Real qv_t = (bdatxlo) ? bdatxlo(ii,jj,k,bdy_comp)
                               : ( oma * bdatxlo_n(ii,jj,k) + alpha * bdatxlo_np1(ii,jj,k) );
-        if (dbg_realbdy_use_primitive_delta) {
+        if (use_primitive_delta) {
             Real qv_c = new_cons(i,j,k,RhoQ1_comp) / amrex::max(rho, Real(1.e-16));
             arr_xlo(i,j,k) = new_cons(i,j,k,RhoQ1_comp) + rho * (qv_t - qv_c);
         } else {
@@ -242,7 +243,7 @@ moist_set_rhs (const Geometry& geom,
         Real rho = new_cons(i,j,k,Rho_comp);
         Real qv_t = (bdatxhi) ? bdatxhi(ii,jj,k,bdy_comp)
                               : ( oma * bdatxhi_n(ii,jj,k) + alpha * bdatxhi_np1(ii,jj,k) );
-        if (dbg_realbdy_use_primitive_delta) {
+        if (use_primitive_delta) {
             Real qv_c = new_cons(i,j,k,RhoQ1_comp) / amrex::max(rho, Real(1.e-16));
             arr_xhi(i,j,k) = new_cons(i,j,k,RhoQ1_comp) + rho * (qv_t - qv_c);
         } else {
@@ -265,7 +266,7 @@ moist_set_rhs (const Geometry& geom,
         Real rho = new_cons(i,j,k,Rho_comp);
         Real qv_t = (bdatylo) ? bdatylo(ii,jj,k,bdy_comp)
                               : ( oma * bdatylo_n(ii,jj,k) + alpha * bdatylo_np1(ii,jj,k) );
-        if (dbg_realbdy_use_primitive_delta) {
+        if (use_primitive_delta) {
             Real qv_c = new_cons(i,j,k,RhoQ1_comp) / amrex::max(rho, Real(1.e-16));
             arr_ylo(i,j,k) = new_cons(i,j,k,RhoQ1_comp) + rho * (qv_t - qv_c);
         } else {
@@ -281,7 +282,7 @@ moist_set_rhs (const Geometry& geom,
         Real rho = new_cons(i,j,k,Rho_comp);
         Real qv_t = (bdatyhi) ? bdatyhi(ii,jj,k,bdy_comp)
                               : ( oma * bdatyhi_n(ii,jj,k) + alpha * bdatyhi_np1(ii,jj,k) );
-        if (dbg_realbdy_use_primitive_delta) {
+        if (use_primitive_delta) {
             Real qv_c = new_cons(i,j,k,RhoQ1_comp) / amrex::max(rho, Real(1.e-16));
             arr_yhi(i,j,k) = new_cons(i,j,k,RhoQ1_comp) + rho * (qv_t - qv_c);
         } else {
