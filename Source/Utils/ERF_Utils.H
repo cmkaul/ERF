@@ -104,7 +104,8 @@ void realbdy_interior_bxs_xy (const amrex::Box& bx,
                               amrex::Box& bx_ylo,
                               amrex::Box& bx_yhi,
                               const amrex::IntVect& ng_vect=amrex::IntVect(0,0,0),
-                              const bool get_int_ng=false);
+                              const bool get_int_ng=false,
+                              const bool y_face_owns_corners=false);
 
 /*
  * Compute relaxation region RHS with wrfbdy
@@ -178,6 +179,28 @@ Time_Avg_Vel_atCC (const amrex::Real& dt,
  */
 AMREX_GPU_HOST
 AMREX_FORCE_INLINE
+amrex::Real
+realbdy_weight_shape (amrex::Real s,
+                      const int profile_id,
+                      const amrex::Real tanh_beta)
+{
+    // Clamp to [0,1] inside nudging strip.
+    s = amrex::max(amrex::Real(0.0), amrex::min(amrex::Real(1.0), s));
+
+    // 0: quadratic (legacy), 1: cosine, 2: tanh-mapped
+    if (profile_id == 1) {
+        constexpr amrex::Real pi = amrex::Real(3.1415926535897932384626433832795);
+        return amrex::Real(0.5) * (amrex::Real(1.0) - std::cos(pi * s));
+    } else if (profile_id == 2) {
+        amrex::Real b = amrex::max(tanh_beta, amrex::Real(1.0e-6));
+        amrex::Real den = std::tanh(b);
+        return (std::tanh(b * (amrex::Real(2.0)*s - amrex::Real(1.0))) + den) / (amrex::Real(2.0)*den);
+    }
+    return s * s;
+}
+
+AMREX_GPU_HOST
+AMREX_FORCE_INLINE
 void
 realbdy_compute_relaxation (const int& icomp,
                             const int& num_var,
@@ -201,9 +224,20 @@ realbdy_compute_relaxation (const int& icomp,
                             const amrex::Array4<const amrex::Real>& v_xhi,
                             const amrex::Array4<const amrex::Real>& v_ylo,
                             const amrex::Array4<const amrex::Real>& v_yhi,
+                            const amrex::Array4<const amrex::Real>& rho_cc_arr,
                             const amrex::Array4<const amrex::Real>& data_arr,
                             const amrex::Array4<amrex::Real>& rhs_arr,
-                            const bool& do_upwind)
+                            const amrex::Real& nudge_scale,
+                            const bool& apply_x_nudging,
+                            const bool& apply_y_nudging,
+                            const bool& exclude_x_corners,
+                            const amrex::Real& force_factor,
+                            const bool& do_upwind,
+                            const bool y_face_owns_corners = false,
+                            const bool y_face_use_max_metric = true,
+                            const bool use_primitive_rhs = false,
+                            const int weight_profile_id = 0,
+                            const amrex::Real weight_tanh_beta = amrex::Real(2.5))
 {
     amrex::IntVect iv = bx_xlo.type();
     amrex::Real ioff  = (iv[0]==1) ? zero : myhalf;
@@ -212,6 +246,7 @@ realbdy_compute_relaxation (const int& icomp,
     const auto& dom_cc_hi = ubound(domain_cc);
     amrex::ParallelFor(bx_xlo, num_var, [=] AMREX_GPU_DEVICE (int i, int j, int k, int n) noexcept
     {
+        if (!apply_x_nudging) { return; }
         // Corners with x boxes
         amrex::Real x = ProbLo[0] + (i + ioff) * dx[0];
         amrex::Real y = ProbLo[1] + (j + joff) * dx[1];
@@ -222,10 +257,29 @@ realbdy_compute_relaxation (const int& icomp,
         amrex::Real eta_lo = (y < y_end ) ? (y_end  - y) / (y_end  - ProbLo[1]) : zero;
         amrex::Real eta_hi = (y > y_strt) ? (y - y_strt) / (ProbHi[1] - y_strt) : zero;
         amrex::Real eta    = std::max(eta_lo,eta_hi);
-        amrex::Real Factor = std::max(xi*xi,eta*eta);
+        if (exclude_x_corners && eta > zero) { return; }
+        amrex::Real wx = realbdy_weight_shape(xi,  weight_profile_id, weight_tanh_beta);
+        amrex::Real wy = realbdy_weight_shape(eta, weight_profile_id, weight_tanh_beta);
+        amrex::Real Factor = std::max(wx,wy);
+        if (force_factor >= zero) { Factor = force_factor; }
 
+        int ii = std::min(std::max(i,dom_cc_lo.x),dom_cc_hi.x);
+        int jj = std::min(std::max(j,dom_cc_lo.y),dom_cc_hi.y);
+        amrex::Real rho_loc = amrex::max(rho_cc_arr(ii,jj,k,Rho_comp), amrex::Real(1.e-16));
+        if (iv[0] == 1 && iv[1] == 0) {
+            int iim1 = std::min(std::max(i-1,dom_cc_lo.x),dom_cc_hi.x);
+            rho_loc = amrex::max(myhalf * (rho_cc_arr(iim1,jj,k,Rho_comp) + rho_cc_arr(ii,jj,k,Rho_comp)), amrex::Real(1.e-16));
+        } else if (iv[0] == 0 && iv[1] == 1) {
+            int jjm1 = std::min(std::max(j-1,dom_cc_lo.y),dom_cc_hi.y);
+            rho_loc = amrex::max(myhalf * (rho_cc_arr(ii,jjm1,k,Rho_comp) + rho_cc_arr(ii,jj,k,Rho_comp)), amrex::Real(1.e-16));
+        }
         amrex::Real delta = arr_xlo(i  ,j  ,k,n) - data_arr(i  ,j  ,k  ,n+icomp);
-        amrex::Real Temp  = Factor*F1*delta;
+        if (use_primitive_rhs) {
+            amrex::Real targ_prim = arr_xlo(i,j,k,n) / rho_loc;
+            amrex::Real cur_prim  = data_arr(i,j,k,n+icomp) / rho_loc;
+            delta = targ_prim - cur_prim;
+        }
+        amrex::Real Temp  = nudge_scale * Factor*F1*delta;
         if (!do_upwind) {
             rhs_arr(i,j,k,n+icomp) += Temp;
         } else {
@@ -240,6 +294,7 @@ realbdy_compute_relaxation (const int& icomp,
     },
     bx_xhi, num_var, [=] AMREX_GPU_DEVICE (int i, int j, int k, int n) noexcept
     {
+        if (!apply_x_nudging) { return; }
         // Corners with x boxes
         amrex::Real x = ProbLo[0] + (i + ioff) * dx[0];
         amrex::Real y = ProbLo[1] + (j + joff) * dx[1];
@@ -250,10 +305,29 @@ realbdy_compute_relaxation (const int& icomp,
         amrex::Real eta_lo = (y < y_end ) ? (y_end  - y) / (y_end  - ProbLo[1]) : zero;
         amrex::Real eta_hi = (y > y_strt) ? (y - y_strt) / (ProbHi[1] - y_strt) : zero;
         amrex::Real eta    = std::max(eta_lo,eta_hi);
-        amrex::Real Factor = std::max(xi*xi,eta*eta);
+        if (exclude_x_corners && eta > zero) { return; }
+        amrex::Real wx = realbdy_weight_shape(xi,  weight_profile_id, weight_tanh_beta);
+        amrex::Real wy = realbdy_weight_shape(eta, weight_profile_id, weight_tanh_beta);
+        amrex::Real Factor = std::max(wx,wy);
+        if (force_factor >= zero) { Factor = force_factor; }
 
+        int ii = std::min(std::max(i,dom_cc_lo.x),dom_cc_hi.x);
+        int jj = std::min(std::max(j,dom_cc_lo.y),dom_cc_hi.y);
+        amrex::Real rho_loc = amrex::max(rho_cc_arr(ii,jj,k,Rho_comp), amrex::Real(1.e-16));
+        if (iv[0] == 1 && iv[1] == 0) {
+            int iim1 = std::min(std::max(i-1,dom_cc_lo.x),dom_cc_hi.x);
+            rho_loc = amrex::max(myhalf * (rho_cc_arr(iim1,jj,k,Rho_comp) + rho_cc_arr(ii,jj,k,Rho_comp)), amrex::Real(1.e-16));
+        } else if (iv[0] == 0 && iv[1] == 1) {
+            int jjm1 = std::min(std::max(j-1,dom_cc_lo.y),dom_cc_hi.y);
+            rho_loc = amrex::max(myhalf * (rho_cc_arr(ii,jjm1,k,Rho_comp) + rho_cc_arr(ii,jj,k,Rho_comp)), amrex::Real(1.e-16));
+        }
         amrex::Real delta = arr_xhi(i  ,j  ,k,n) - data_arr(i  ,j  ,k  ,n+icomp);
-        amrex::Real Temp  = Factor*F1*delta;
+        if (use_primitive_rhs) {
+            amrex::Real targ_prim = arr_xhi(i,j,k,n) / rho_loc;
+            amrex::Real cur_prim  = data_arr(i,j,k,n+icomp) / rho_loc;
+            delta = targ_prim - cur_prim;
+        }
+        amrex::Real Temp  = nudge_scale * Factor*F1*delta;
         if (!do_upwind) {
             rhs_arr(i,j,k,n+icomp) += Temp;
         } else {
@@ -269,14 +343,41 @@ realbdy_compute_relaxation (const int& icomp,
 
     amrex::ParallelFor(bx_ylo, num_var, [=] AMREX_GPU_DEVICE (int i, int j, int k, int n) noexcept
     {
-        // No corners for y boxes
+        if (!apply_y_nudging) { return; }
+        // Legacy y-side weighting is eta^2. If y faces own corners, use
+        // symmetric corner-aware weighting max(xi^2, eta^2).
+        amrex::Real x      = ProbLo[0] + (i + ioff) * dx[0];
         amrex::Real y      = ProbLo[1] + (j + joff) * dx[1];
+        amrex::Real x_end  = ProbLo[0] + width * dx[0];
+        amrex::Real x_strt = ProbHi[0] - width * dx[0];
         amrex::Real y_end  = ProbLo[1] + width * dx[1];
+        amrex::Real xi_lo  = (x < x_end ) ? (x_end  - x) / (x_end  - ProbLo[0]) : zero;
+        amrex::Real xi_hi  = (x > x_strt) ? (x - x_strt) / (ProbHi[0] - x_strt) : zero;
+        amrex::Real xi     = std::max(xi_lo,xi_hi);
         amrex::Real eta    = (y_end - y) / (y_end - ProbLo[1]);
-        amrex::Real Factor = eta*eta;
+        amrex::Real wx = realbdy_weight_shape(xi,  weight_profile_id, weight_tanh_beta);
+        amrex::Real wy = realbdy_weight_shape(eta, weight_profile_id, weight_tanh_beta);
+        amrex::Real Factor = (y_face_owns_corners && y_face_use_max_metric)
+                                 ? std::max(wx,wy) : wy;
+        if (force_factor >= zero) { Factor = force_factor; }
 
+        int ii = std::min(std::max(i,dom_cc_lo.x),dom_cc_hi.x);
+        int jj = std::min(std::max(j,dom_cc_lo.y),dom_cc_hi.y);
+        amrex::Real rho_loc = amrex::max(rho_cc_arr(ii,jj,k,Rho_comp), amrex::Real(1.e-16));
+        if (iv[0] == 1 && iv[1] == 0) {
+            int iim1 = std::min(std::max(i-1,dom_cc_lo.x),dom_cc_hi.x);
+            rho_loc = amrex::max(myhalf * (rho_cc_arr(iim1,jj,k,Rho_comp) + rho_cc_arr(ii,jj,k,Rho_comp)), amrex::Real(1.e-16));
+        } else if (iv[0] == 0 && iv[1] == 1) {
+            int jjm1 = std::min(std::max(j-1,dom_cc_lo.y),dom_cc_hi.y);
+            rho_loc = amrex::max(myhalf * (rho_cc_arr(ii,jjm1,k,Rho_comp) + rho_cc_arr(ii,jj,k,Rho_comp)), amrex::Real(1.e-16));
+        }
         amrex::Real delta = arr_ylo(i  ,j  ,k,n) - data_arr(i  ,j  ,k  ,n+icomp);
-        amrex::Real Temp  = Factor*F1*delta;
+        if (use_primitive_rhs) {
+            amrex::Real targ_prim = arr_ylo(i,j,k,n) / rho_loc;
+            amrex::Real cur_prim  = data_arr(i,j,k,n+icomp) / rho_loc;
+            delta = targ_prim - cur_prim;
+        }
+        amrex::Real Temp  = nudge_scale * Factor*F1*delta;
         if (!do_upwind) {
             rhs_arr(i,j,k,n+icomp) += Temp;
         } else {
@@ -288,14 +389,41 @@ realbdy_compute_relaxation (const int& icomp,
     },
     bx_yhi, num_var, [=] AMREX_GPU_DEVICE (int i, int j, int k, int n) noexcept
     {
-        // No corners for y boxes
+        if (!apply_y_nudging) { return; }
+        // Legacy y-side weighting is eta^2. If y faces own corners, use
+        // symmetric corner-aware weighting max(xi^2, eta^2).
+        amrex::Real x      = ProbLo[0] + (i + ioff) * dx[0];
         amrex::Real y      = ProbLo[1] + (j + joff) * dx[1];
+        amrex::Real x_end  = ProbLo[0] + width * dx[0];
+        amrex::Real x_strt = ProbHi[0] - width * dx[0];
         amrex::Real y_strt = ProbHi[1] - width * dx[1];
+        amrex::Real xi_lo  = (x < x_end ) ? (x_end  - x) / (x_end  - ProbLo[0]) : zero;
+        amrex::Real xi_hi  = (x > x_strt) ? (x - x_strt) / (ProbHi[0] - x_strt) : zero;
+        amrex::Real xi     = std::max(xi_lo,xi_hi);
         amrex::Real eta    = (y - y_strt) / (ProbHi[1] - y_strt);
-        amrex::Real Factor = eta*eta;
+        amrex::Real wx = realbdy_weight_shape(xi,  weight_profile_id, weight_tanh_beta);
+        amrex::Real wy = realbdy_weight_shape(eta, weight_profile_id, weight_tanh_beta);
+        amrex::Real Factor = (y_face_owns_corners && y_face_use_max_metric)
+                                 ? std::max(wx,wy) : wy;
+        if (force_factor >= zero) { Factor = force_factor; }
 
+        int ii = std::min(std::max(i,dom_cc_lo.x),dom_cc_hi.x);
+        int jj = std::min(std::max(j,dom_cc_lo.y),dom_cc_hi.y);
+        amrex::Real rho_loc = amrex::max(rho_cc_arr(ii,jj,k,Rho_comp), amrex::Real(1.e-16));
+        if (iv[0] == 1 && iv[1] == 0) {
+            int iim1 = std::min(std::max(i-1,dom_cc_lo.x),dom_cc_hi.x);
+            rho_loc = amrex::max(myhalf * (rho_cc_arr(iim1,jj,k,Rho_comp) + rho_cc_arr(ii,jj,k,Rho_comp)), amrex::Real(1.e-16));
+        } else if (iv[0] == 0 && iv[1] == 1) {
+            int jjm1 = std::min(std::max(j-1,dom_cc_lo.y),dom_cc_hi.y);
+            rho_loc = amrex::max(myhalf * (rho_cc_arr(ii,jjm1,k,Rho_comp) + rho_cc_arr(ii,jj,k,Rho_comp)), amrex::Real(1.e-16));
+        }
         amrex::Real delta = arr_yhi(i  ,j  ,k,n) - data_arr(i  ,j  ,k  ,n+icomp);
-        amrex::Real Temp  = Factor*F1*delta;
+        if (use_primitive_rhs) {
+            amrex::Real targ_prim = arr_yhi(i,j,k,n) / rho_loc;
+            amrex::Real cur_prim  = data_arr(i,j,k,n+icomp) / rho_loc;
+            delta = targ_prim - cur_prim;
+        }
+        amrex::Real Temp  = nudge_scale * Factor*F1*delta;
         if (!do_upwind) {
             rhs_arr(i,j,k,n+icomp) += Temp;
         } else {

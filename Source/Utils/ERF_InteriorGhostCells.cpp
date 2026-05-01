@@ -28,14 +28,14 @@ realbdy_interior_bxs_xy (const Box& bx,
                          Box& bx_ylo,
                          Box& bx_yhi,
                          const IntVect& ng_vect,
-                         const bool get_int_ng)
+                         const bool get_int_ng,
+                         const bool y_face_owns_corners)
 {
     AMREX_ALWAYS_ASSERT(bx.ixType() == domain.ixType());
 
     //==================================================================
-    // NOTE: X-face boxes take ownership of the overlapping region.
-    //       With exterior ghost cells (ng_vect != 0), the x-face
-    //       boxes will have exterior ghost cells in both x & y.
+    // NOTE: Ownership of overlapping corner region is configurable.
+    //       Legacy/default behavior is x-face ownership.
     //==================================================================
 
     // Domain bounds without ghost cells
@@ -50,9 +50,16 @@ realbdy_interior_bxs_xy (const Box& bx,
     gdom_xlo.setBig(0,dom_lo.x+width-1); gdom_xhi.setSmall(0,dom_hi.x-width+1);
     gdom_ylo.setBig(1,dom_lo.y+width-1); gdom_yhi.setSmall(1,dom_hi.y-width+1);
 
-    // Remove overlapping corners from y-face boxes
-    gdom_ylo.setSmall(0,gdom_xlo.bigEnd(0)+1); gdom_ylo.setBig(0,gdom_xhi.smallEnd(0)-1);
-    gdom_yhi.setSmall(0,gdom_xlo.bigEnd(0)+1); gdom_yhi.setBig(0,gdom_xhi.smallEnd(0)-1);
+    // Remove overlapping corners using selected ownership.
+    if (!y_face_owns_corners) {
+        // Legacy/default: x-face boxes own corners
+        gdom_ylo.setSmall(0,gdom_xlo.bigEnd(0)+1); gdom_ylo.setBig(0,gdom_xhi.smallEnd(0)-1);
+        gdom_yhi.setSmall(0,gdom_xlo.bigEnd(0)+1); gdom_yhi.setBig(0,gdom_xhi.smallEnd(0)-1);
+    } else {
+        // Debug option: y-face boxes own corners
+        gdom_xlo.setSmall(1,gdom_ylo.bigEnd(1)+1); gdom_xlo.setBig(1,gdom_yhi.smallEnd(1)-1);
+        gdom_xhi.setSmall(1,gdom_ylo.bigEnd(1)+1); gdom_xhi.setBig(1,gdom_yhi.smallEnd(1)-1);
+    }
 
     // Grow boxes to get external ghost cells only
     gdom_xlo.growLo(0,ng_vect[0]); gdom_xhi.growHi(0,ng_vect[0]);
@@ -112,6 +119,89 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
 {
     BL_PROFILE_REGION("realbdy_compute_interior_ghost_RHS()");
 
+    // Debug controls for isolating real-boundary nudging behavior.
+    static bool dbg_flags_init = false;
+    static bool dbg_nudge_uv = true;
+    static bool dbg_nudge_tq = true;
+    static bool dbg_nudge_x = true;
+    static bool dbg_nudge_y = true;
+    static bool dbg_nudge_print_stats = false;
+    static bool dbg_nudge_print_v_only = false;
+    static bool dbg_tend_v_print = false;
+    static bool dbg_nudge_freeze_alpha = false;
+    static bool dbg_nudge_exclude_x_corners = false;
+    static bool dbg_realbdy_yface_corner_owner = false;
+    static bool dbg_realbdy_component_corner_owner = false;
+    static bool dbg_realbdy_yface_corner_use_max_metric = true;
+    static bool dbg_realbdy_use_primitive_delta = false;
+    static std::string dbg_realbdy_weight_profile = "quadratic";
+    static int dbg_realbdy_weight_profile_id = 0; // 0=quadratic,1=cosine,2=tanh
+    static Real dbg_realbdy_weight_tanh_beta = Real(2.5);
+    static bool dbg_corner_owner_print_once = false;
+    static Real dbg_nudge_const_factor = Real(-1.0);
+    static Real dbg_nudge_factor_uv = Real(-1.0);
+    static Real dbg_nudge_factor_tq = Real(-1.0);
+    if (!dbg_flags_init) {
+        ParmParse pp("erf");
+        pp.query("dbg_nudge_uv", dbg_nudge_uv);
+        pp.query("dbg_nudge_tq", dbg_nudge_tq);
+        pp.query("dbg_nudge_x",  dbg_nudge_x);
+        pp.query("dbg_nudge_y",  dbg_nudge_y);
+        pp.query("dbg_nudge_print_stats", dbg_nudge_print_stats);
+        pp.query("dbg_nudge_print_v_only", dbg_nudge_print_v_only);
+        pp.query("dbg_tend_v_print", dbg_tend_v_print);
+        pp.query("dbg_nudge_freeze_alpha", dbg_nudge_freeze_alpha);
+        pp.query("dbg_nudge_exclude_x_corners", dbg_nudge_exclude_x_corners);
+        pp.query("dbg_realbdy_yface_corner_owner", dbg_realbdy_yface_corner_owner);
+        pp.query("dbg_realbdy_component_corner_owner", dbg_realbdy_component_corner_owner);
+        pp.query("dbg_realbdy_yface_corner_use_max_metric", dbg_realbdy_yface_corner_use_max_metric);
+        pp.query("dbg_realbdy_use_primitive_delta", dbg_realbdy_use_primitive_delta);
+        pp.query("dbg_realbdy_weight_profile", dbg_realbdy_weight_profile);
+        pp.query("dbg_realbdy_weight_tanh_beta", dbg_realbdy_weight_tanh_beta);
+        pp.query("dbg_nudge_const_factor", dbg_nudge_const_factor);
+        pp.query("dbg_nudge_factor_uv", dbg_nudge_factor_uv);
+        pp.query("dbg_nudge_factor_tq", dbg_nudge_factor_tq);
+
+        if (dbg_realbdy_weight_profile == "quadratic" || dbg_realbdy_weight_profile == "quad") {
+            dbg_realbdy_weight_profile_id = 0;
+        } else if (dbg_realbdy_weight_profile == "cosine" || dbg_realbdy_weight_profile == "cos") {
+            dbg_realbdy_weight_profile_id = 1;
+        } else if (dbg_realbdy_weight_profile == "tanh") {
+            dbg_realbdy_weight_profile_id = 2;
+        } else {
+            if (ParallelDescriptor::IOProcessor()) {
+                Print() << "WARNING: Unknown erf.dbg_realbdy_weight_profile='"
+                        << dbg_realbdy_weight_profile
+                        << "'. Falling back to 'quadratic'.\n";
+            }
+            dbg_realbdy_weight_profile_id = 0;
+            dbg_realbdy_weight_profile = "quadratic";
+        }
+        dbg_flags_init = true;
+    }
+
+    if (!dbg_corner_owner_print_once && ParallelDescriptor::IOProcessor()) {
+        if (dbg_realbdy_component_corner_owner) {
+            Print() << "[DBG_CORNER_OWNER] mode=component-aware "
+                    << "U=x-owner V=y-owner T=x-owner "
+                    << "(dbg_realbdy_component_corner_owner=1, "
+                    << "dbg_realbdy_yface_corner_owner=" << dbg_realbdy_yface_corner_owner << ", "
+                    << "dbg_realbdy_yface_corner_use_max_metric=" << dbg_realbdy_yface_corner_use_max_metric << ", "
+                    << "dbg_realbdy_weight_profile='" << dbg_realbdy_weight_profile << "', "
+                    << "dbg_realbdy_weight_tanh_beta=" << dbg_realbdy_weight_tanh_beta
+                    << ")\n";
+        } else {
+            Print() << "[DBG_CORNER_OWNER] mode=global "
+                    << (dbg_realbdy_yface_corner_owner ? "all=y-owner" : "all=x-owner")
+                    << " (dbg_realbdy_component_corner_owner=0, "
+                    << "dbg_realbdy_yface_corner_use_max_metric=" << dbg_realbdy_yface_corner_use_max_metric << ", "
+                    << "dbg_realbdy_weight_profile='" << dbg_realbdy_weight_profile << "', "
+                    << "dbg_realbdy_weight_tanh_beta=" << dbg_realbdy_weight_tanh_beta
+                    << ")\n";
+        }
+        dbg_corner_owner_print_once = true;
+    }
+
     // HACK HACK HACK
     // Get bndry data
     Vector<int> ind_map2 = {BCVars::xvel_bc, BCVars::yvel_bc, BCVars::RhoTheta_bc_comp};
@@ -148,6 +238,10 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
 
     AMREX_ALWAYS_ASSERT( alpha >= zero && alpha <= one);
     Real oma   = one - alpha;
+    if (dbg_nudge_freeze_alpha) {
+        oma = one;
+        alpha = zero;
+    }
 
     /*
     // UNIT TEST DEBUG
@@ -179,6 +273,13 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
     // Size the FABs
     //==========================================================
     for (int ivar(ivarU); ivar < BdyEnd; ivar++) {
+        bool y_face_owns_corners = dbg_realbdy_yface_corner_owner;
+        if (dbg_realbdy_component_corner_owner) {
+            // Component-aware corner ownership:
+            // u -> x-face ownership, v -> y-face ownership, scalars -> x-face ownership.
+            y_face_owns_corners = (ivar == ivarV);
+        }
+
         int ivar_idx = var_map[ivar];
         Box domain   = geom.Domain();
         auto ixtype  = S_cur_data[ivar_idx].boxArray().ixType();
@@ -192,7 +293,8 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
         realbdy_interior_bxs_xy(gdom, domain, width,
                                 bx_xlo, bx_xhi,
                                 bx_ylo, bx_yhi,
-                                ng_vect, true);
+                                ng_vect, true,
+                                y_face_owns_corners);
 
         // Size the FABs
         if (ivar  == ivarU) {
@@ -219,6 +321,11 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
     // Populate FABs from bdy interpolation (primitive vars)
     //==========================================================
     for (int ivar(ivarU); ivar < BdyEnd; ivar++) {
+        bool y_face_owns_corners = dbg_realbdy_yface_corner_owner;
+        if (dbg_realbdy_component_corner_owner) {
+            y_face_owns_corners = (ivar == ivarV);
+        }
+
         int ivar_idx = var_map[ivar];
         Box domain   = geom.Domain();
         auto ixtype  = S_cur_data[ivar_idx].boxArray().ixType();
@@ -243,7 +350,8 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
             realbdy_interior_bxs_xy(gtbx, domain, width,
                                     tbx_xlo, tbx_xhi,
                                     tbx_ylo, tbx_yhi,
-                                    ng_vect, true);
+                                    ng_vect, true,
+                                    y_face_owns_corners);
 
             Array4<Real> arr_xlo;  Array4<Real> arr_xhi;
             Array4<Real> arr_ylo;  Array4<Real> arr_yhi;
@@ -390,8 +498,32 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
     auto ProbLo = geom.ProbLoArray();
     auto ProbHi = geom.ProbHiArray();
     for (int ivar(ivarU); ivar < BdyEnd; ivar++) {
+        bool y_face_owns_corners = dbg_realbdy_yface_corner_owner;
+        if (dbg_realbdy_component_corner_owner) {
+            y_face_owns_corners = (ivar == ivarV);
+        }
+
         int ivar_idx = ivar_map[ivar];
         int icomp    = comp_map[ivar];
+        Real nudge_scale = Real(1.0);
+        if ((ivar == ivarU || ivar == ivarV) && !dbg_nudge_uv) { nudge_scale = Real(0.0); }
+        if (ivar == ivarT && !dbg_nudge_tq) { nudge_scale = Real(0.0); }
+        constexpr int NSIDES = 4;
+        Real best_absdp[NSIDES] = {-1.0, -1.0, -1.0, -1.0};
+        int best_i[NSIDES] = {0,0,0,0};
+        int best_j[NSIDES] = {0,0,0,0};
+        int best_k[NSIDES] = {0,0,0,0};
+        Real best_dc[NSIDES] = {0.0,0.0,0.0,0.0};
+        Real best_dp[NSIDES] = {0.0,0.0,0.0,0.0};
+        Real best_rho[NSIDES] = {0.0,0.0,0.0,0.0};
+        Real best_statep[NSIDES] = {0.0,0.0,0.0,0.0};
+        Real best_targp[NSIDES] = {0.0,0.0,0.0,0.0};
+        Real sum_top_bnd = 0.0, min_top_bnd = std::numeric_limits<Real>::max(), max_top_bnd = -std::numeric_limits<Real>::max();
+        Real sum_top_int = 0.0, min_top_int = std::numeric_limits<Real>::max(), max_top_int = -std::numeric_limits<Real>::max();
+        Long n_top_bnd = 0, n_top_int = 0;
+        Real sum_bot_bnd = 0.0, min_bot_bnd = std::numeric_limits<Real>::max(), max_bot_bnd = -std::numeric_limits<Real>::max();
+        Real sum_bot_int = 0.0, min_bot_int = std::numeric_limits<Real>::max(), max_bot_int = -std::numeric_limits<Real>::max();
+        Long n_bot_bnd = 0, n_bot_int = 0;
 
         Box domain = geom.Domain();
         domain.convert(S_cur_data[ivar_idx].boxArray().ixType());
@@ -406,9 +538,11 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
             realbdy_interior_bxs_xy(tbx, domain, width,
                                     tbx_xlo, tbx_xhi,
                                     tbx_ylo, tbx_yhi,
-                                    ng_vect);
+                                    ng_vect, false,
+                                    y_face_owns_corners);
 
             Array4<Real> rhs_arr; Array4<Real> data_arr;
+            Array4<Real> rho_cc_arr;
             Array4<Real> arr_xlo;  Array4<Real> arr_xhi;
             Array4<Real> arr_ylo;  Array4<Real> arr_yhi;
             if (ivar  == ivarU) {
@@ -416,16 +550,19 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
                 arr_ylo  = U_ylo.array(); arr_yhi = U_yhi.array();
                 rhs_arr  = S_rhs[IntVars::xmom].array(mfi);
                 data_arr = S_cur_data[IntVars::xmom].array(mfi);
+                rho_cc_arr = S_cur_data[IntVars::cons].array(mfi);
             } else if (ivar  == ivarV) {
                 arr_xlo  = V_xlo.array(); arr_xhi = V_xhi.array();
                 arr_ylo  = V_ylo.array(); arr_yhi = V_yhi.array();
                 rhs_arr  = S_rhs[IntVars::ymom].array(mfi);
                 data_arr = S_cur_data[IntVars::ymom].array(mfi);
+                rho_cc_arr = S_cur_data[IntVars::cons].array(mfi);
             } else if (ivar  == ivarT){
                 arr_xlo  = T_xlo.array(); arr_xhi = T_xhi.array();
                 arr_ylo  = T_ylo.array(); arr_yhi = T_yhi.array();
                 rhs_arr  = S_rhs[IntVars::cons].array(mfi);
                 data_arr = S_cur_data[IntVars::cons].array(mfi);
+                rho_cc_arr = S_cur_data[IntVars::cons].array(mfi);
             } else {
                 continue;
             }
@@ -434,12 +571,462 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
             Array4<Real> v_xlo = V_xlo.array(); Array4<Real> v_xhi = V_xhi.array();
             Array4<Real> v_ylo = V_ylo.array(); Array4<Real> v_yhi = V_yhi.array();
 
+            if ((dbg_nudge_print_stats &&
+                 (ivar == ivarV || (ivar == ivarT && !dbg_nudge_print_v_only))) ||
+                (dbg_tend_v_print && ivar == ivarV)) {
+                const auto& rho_arr = S_cur_data[IntVars::cons].const_array(mfi);
+                const auto dom3 = lbound(geom.Domain());
+                const auto domh = ubound(geom.Domain());
+                const int ktop = domh.z;
+                const char* dbg_var = (ivar == ivarT) ? "theta" : "v";
+
+                auto scan_box_for_location = [&](const Box& bx, const Array4<Real>& targ, int iside)
+                {
+                    if (!bx.ok()) return;
+                    const auto lo = lbound(bx);
+                    const auto hi = ubound(bx);
+                    for (int k = lo.z; k <= hi.z; ++k) {
+                        for (int j = lo.y; j <= hi.y; ++j) {
+                            for (int i = lo.x; i <= hi.x; ++i) {
+                                int ic = std::min(std::max(i, dom3.x), domh.x);
+                                int jc = std::min(std::max(j, dom3.y), domh.y);
+                                Real rho;
+                                if (ivar == ivarV) {
+                                    int jcm1 = std::min(std::max(j-1, dom3.y), domh.y);
+                                    rho = amrex::max(myhalf * (rho_arr(ic,jcm1,k,Rho_comp) + rho_arr(ic,jc,k,Rho_comp)), Real(1.e-16));
+                                } else {
+                                    rho = amrex::max(rho_arr(ic,jc,k,Rho_comp), Real(1.e-16));
+                                }
+                                Real dc  = targ(i,j,k,0) - data_arr(i,j,k,icomp);
+                                Real dp  = dc / rho;
+                                Real adp = std::abs(dp);
+                                if (adp > best_absdp[iside]) {
+                                    best_absdp[iside] = adp;
+                                    best_i[iside] = i;
+                                    best_j[iside] = j;
+                                    best_k[iside] = k;
+                                    best_dc[iside] = dc;
+                                    best_dp[iside] = dp;
+                                    best_rho[iside] = rho;
+                                    best_statep[iside] = data_arr(i,j,k,icomp) / rho;
+                                    best_targp[iside] = targ(i,j,k,0) / rho;
+                                }
+                            }
+                        }
+                    }
+                };
+                auto print_stats_for_side = [&](const Box& bx, const Array4<Real>& targ, const char* sname)
+                {
+                    if (!bx.ok()) return;
+                    ReduceOps<ReduceOpSum, ReduceOpSum, ReduceOpMax, ReduceOpMax,
+                              ReduceOpMin, ReduceOpMax, ReduceOpSum,
+                              ReduceOpSum, ReduceOpSum, ReduceOpMax, ReduceOpMax> reduce_op;
+                    ReduceData<Real, Real, Real, Real, Real, Real, Long,
+                               Real, Real, Real, Real> reduce_data(reduce_op);
+                    using ReduceTuple = typename decltype(reduce_data)::Type;
+                    reduce_op.eval(bx, reduce_data, [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept -> ReduceTuple
+                    {
+                        Real dc  = targ(i,j,k,0) - data_arr(i,j,k,icomp);
+                        int ic = amrex::min(amrex::max(i, dom3.x), domh.x);
+                        int jc = amrex::min(amrex::max(j, dom3.y), domh.y);
+                        Real rho;
+                        if (ivar == ivarV) {
+                            int jcm1 = amrex::min(amrex::max(j-1, dom3.y), domh.y);
+                            rho = amrex::max(myhalf * (rho_arr(ic,jcm1,k,Rho_comp) + rho_arr(ic,jc,k,Rho_comp)), Real(1.e-16));
+                        } else {
+                            rho = amrex::max(rho_arr(ic,jc,k,Rho_comp), Real(1.e-16));
+                        }
+                        Real sp  = data_arr(i,j,k,icomp) / rho;
+                        Real tp  = targ(i,j,k,0) / rho;
+                        Real dp  = dc / rho;
+                        return {dc, dp, std::abs(dc), std::abs(dp), rho, rho, Long(1),
+                                sp, tp, std::abs(sp), std::abs(tp)};
+                    });
+                    auto hv = reduce_data.value();
+
+                    Real sum_dc     = amrex::get<0>(hv);
+                    Real sum_dp     = amrex::get<1>(hv);
+                    Real maxabs_dc  = amrex::get<2>(hv);
+                    Real maxabs_dp  = amrex::get<3>(hv);
+                    Real rho_min    = amrex::get<4>(hv);
+                    Real rho_max    = amrex::get<5>(hv);
+                    Long n          = amrex::get<6>(hv);
+                    Real sum_statep = amrex::get<7>(hv);
+                    Real sum_targp  = amrex::get<8>(hv);
+                    Real maxabs_sp  = amrex::get<9>(hv);
+                    Real maxabs_tp  = amrex::get<10>(hv);
+
+                    if (ivar == ivarV) {
+                        const int my_rank = ParallelDescriptor::MyProc();
+                        if (n > 0) {
+                            amrex::AllPrint() << "[DBG_NUDGE " << dbg_var << "]"
+                                              << " rank=" << my_rank
+                                              << " t=" << time
+                                              << " t_elapsed=" << (time-start_bdy_time)
+                                              << " bdy_idx=" << n_time
+                                              << " side=" << sname
+                                              << " mean_statep=" << (sum_statep/Real(n))
+                                              << " mean_targp=" << (sum_targp/Real(n))
+                                              << " maxabs_statep=" << maxabs_sp
+                                              << " maxabs_targp=" << maxabs_tp
+                                              << " mean_dc=" << (sum_dc/Real(n))
+                                              << " maxabs_dc=" << maxabs_dc
+                                              << " mean_dp=" << (sum_dp/Real(n))
+                                              << " maxabs_dp=" << maxabs_dp
+                                              << " rho_min=" << rho_min
+                                              << " rho_max=" << rho_max
+                                              << " n=" << n
+                                              << "\n";
+                        }
+                        return;
+                    }
+
+                    ParallelDescriptor::ReduceRealSum(sum_dc);
+                    ParallelDescriptor::ReduceRealSum(sum_dp);
+                    ParallelDescriptor::ReduceRealMax(maxabs_dc);
+                    ParallelDescriptor::ReduceRealMax(maxabs_dp);
+                    ParallelDescriptor::ReduceRealMin(rho_min);
+                    ParallelDescriptor::ReduceRealMax(rho_max);
+                    ParallelDescriptor::ReduceLongSum(n);
+                    ParallelDescriptor::ReduceRealSum(sum_statep);
+                    ParallelDescriptor::ReduceRealSum(sum_targp);
+                    ParallelDescriptor::ReduceRealMax(maxabs_sp);
+                    ParallelDescriptor::ReduceRealMax(maxabs_tp);
+
+                    if (ParallelDescriptor::IOProcessor() && n > 0) {
+                        Print() << "[DBG_NUDGE " << dbg_var << "]"
+                                << " t=" << time
+                                << " t_elapsed=" << (time-start_bdy_time)
+                                << " bdy_idx=" << n_time
+                                << " side=" << sname
+                                << " mean_statep=" << (sum_statep/Real(n))
+                                << " mean_targp=" << (sum_targp/Real(n))
+                                << " maxabs_statep=" << maxabs_sp
+                                << " maxabs_targp=" << maxabs_tp
+                                << " mean_dc=" << (sum_dc/Real(n))
+                                << " maxabs_dc=" << maxabs_dc
+                                << " mean_dp=" << (sum_dp/Real(n))
+                                << " maxabs_dp=" << maxabs_dp
+                                << " rho_min=" << rho_min
+                                << " rho_max=" << rho_max
+                                << " n=" << n
+                                << "\n";
+                    }
+                };
+
+                auto print_xside_corner_split = [&](const Box& bx, const Array4<Real>& targ, const char* side_tag)
+                {
+                    if (!bx.ok()) return;
+                    ReduceOps<ReduceOpSum, ReduceOpMax, ReduceOpSum,
+                              ReduceOpSum, ReduceOpMax, ReduceOpSum> rop;
+                    ReduceData<Real, Real, Long, Real, Real, Long> rdata(rop);
+                    using RT = typename decltype(rdata)::Type;
+                    rop.eval(bx, rdata, [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept -> RT
+                    {
+                        int ic = amrex::min(amrex::max(i, dom3.x), domh.x);
+                        int jc = amrex::min(amrex::max(j, dom3.y), domh.y);
+                        Real rho;
+                        if (ivar == ivarV) {
+                            int jcm1 = amrex::min(amrex::max(j-1, dom3.y), domh.y);
+                            rho = amrex::max(myhalf * (rho_arr(ic,jcm1,k,Rho_comp) + rho_arr(ic,jc,k,Rho_comp)), Real(1.e-16));
+                        } else {
+                            rho = amrex::max(rho_arr(ic,jc,k,Rho_comp), Real(1.e-16));
+                        }
+                        Real dp  = (targ(i,j,k,0) - data_arr(i,j,k,icomp)) / rho;
+                        bool is_corner = (j < dom3.y + width) || (j > domh.y - width);
+                        if (is_corner) {
+                            return {dp, std::abs(dp), Long(1), Real(0.0), Real(0.0), Long(0)};
+                        } else {
+                            return {Real(0.0), Real(0.0), Long(0), dp, std::abs(dp), Long(1)};
+                        }
+                    });
+                    auto hv = rdata.value();
+                    Real sum_dp_c    = amrex::get<0>(hv);
+                    Real maxabs_dp_c = amrex::get<1>(hv);
+                    Long n_c         = amrex::get<2>(hv);
+                    Real sum_dp_e    = amrex::get<3>(hv);
+                    Real maxabs_dp_e = amrex::get<4>(hv);
+                    Long n_e         = amrex::get<5>(hv);
+                    if (n_c > 0 || n_e > 0) {
+                        const int my_rank = ParallelDescriptor::MyProc();
+                        amrex::AllPrint() << "[DBG_NUDGE " << dbg_var << "_" << side_tag << "_corner_split]"
+                                          << " rank=" << my_rank
+                                          << " t=" << time
+                                          << " t_elapsed=" << (time-start_bdy_time)
+                                          << " bdy_idx=" << n_time
+                                          << " width=" << width
+                                          << " corner_mean_dp=" << (n_c > 0 ? sum_dp_c/Real(n_c) : Real(0.0))
+                                          << " corner_maxabs_dp=" << (n_c > 0 ? maxabs_dp_c : Real(0.0))
+                                          << " corner_n=" << n_c
+                                          << " edge_mean_dp=" << (n_e > 0 ? sum_dp_e/Real(n_e) : Real(0.0))
+                                          << " edge_maxabs_dp=" << (n_e > 0 ? maxabs_dp_e : Real(0.0))
+                                          << " edge_n=" << n_e
+                                          << "\n";
+                    }
+                };
+
+                auto print_xside_setrelax_split = [&](const Box& bx, const Array4<Real>& targ, const bool is_hi, const char* side_tag)
+                {
+                    if (!bx.ok()) return;
+                    ReduceOps<ReduceOpSum, ReduceOpMax, ReduceOpSum,
+                              ReduceOpSum, ReduceOpMax, ReduceOpSum> rop;
+                    ReduceData<Real, Real, Long, Real, Real, Long> rdata(rop);
+                    using RT = typename decltype(rdata)::Type;
+                    rop.eval(bx, rdata, [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept -> RT
+                    {
+                        int ic = amrex::min(amrex::max(i, dom3.x), domh.x);
+                        int jc = amrex::min(amrex::max(j, dom3.y), domh.y);
+                        Real rho;
+                        if (ivar == ivarV) {
+                            int jcm1 = amrex::min(amrex::max(j-1, dom3.y), domh.y);
+                            rho = amrex::max(myhalf * (rho_arr(ic,jcm1,k,Rho_comp) + rho_arr(ic,jc,k,Rho_comp)), Real(1.e-16));
+                        } else {
+                            rho = amrex::max(rho_arr(ic,jc,k,Rho_comp), Real(1.e-16));
+                        }
+                        Real dp = (targ(i,j,k,0) - data_arr(i,j,k,icomp)) / rho;
+                        int dist = is_hi ? (domh.x - i) : (i - dom3.x);
+                        bool is_set = (dist == 0);
+                        if (is_set) {
+                            return {dp, std::abs(dp), Long(1), Real(0.0), Real(0.0), Long(0)};
+                        } else {
+                            return {Real(0.0), Real(0.0), Long(0), dp, std::abs(dp), Long(1)};
+                        }
+                    });
+                    auto hv = rdata.value();
+                    Real sum_dp_set    = amrex::get<0>(hv);
+                    Real maxabs_dp_set = amrex::get<1>(hv);
+                    Long n_set         = amrex::get<2>(hv);
+                    Real sum_dp_relax    = amrex::get<3>(hv);
+                    Real maxabs_dp_relax = amrex::get<4>(hv);
+                    Long n_relax         = amrex::get<5>(hv);
+                    if (n_set > 0 || n_relax > 0) {
+                        const int my_rank = ParallelDescriptor::MyProc();
+                        amrex::AllPrint() << "[DBG_NUDGE " << dbg_var << "_" << side_tag << "_setrelax_split]"
+                                          << " rank=" << my_rank
+                                          << " t=" << time
+                                          << " t_elapsed=" << (time-start_bdy_time)
+                                          << " bdy_idx=" << n_time
+                                          << " width=" << width
+                                          << " set_mean_dp=" << (n_set > 0 ? sum_dp_set/Real(n_set) : Real(0.0))
+                                          << " set_maxabs_dp=" << (n_set > 0 ? maxabs_dp_set : Real(0.0))
+                                          << " set_n=" << n_set
+                                          << " relax_mean_dp=" << (n_relax > 0 ? sum_dp_relax/Real(n_relax) : Real(0.0))
+                                          << " relax_maxabs_dp=" << (n_relax > 0 ? maxabs_dp_relax : Real(0.0))
+                                          << " relax_n=" << n_relax
+                                          << "\n";
+                    }
+                };
+
+                auto print_tend_for_side = [&](const Box& bx, const Array4<Real>& targ, const char* sname)
+                {
+                    if (!bx.ok()) return;
+                    const auto iv = bx.type();
+                    const Real ioff = (iv[0] == 1) ? zero : myhalf;
+                    const Real joff = (iv[1] == 1) ? zero : myhalf;
+                    const auto dom_cc_lo = lbound(geom.Domain());
+                    const auto dom_cc_hi = ubound(geom.Domain());
+
+                    ReduceOps<ReduceOpSum, ReduceOpMax, ReduceOpSum,
+                              ReduceOpSum, ReduceOpMax, ReduceOpSum> rop;
+                    ReduceData<Real, Real, Long, Real, Real, Long> rdata(rop);
+                    using RT = typename decltype(rdata)::Type;
+                    rop.eval(bx, rdata, [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept -> RT
+                    {
+                        int ic = amrex::min(amrex::max(i, dom3.x), domh.x);
+                        int jc = amrex::min(amrex::max(j, dom3.y), domh.y);
+                        Real rho;
+                        if (ivar == ivarV) {
+                            int jcm1 = amrex::min(amrex::max(j-1, dom3.y), domh.y);
+                            rho = amrex::max(myhalf * (rho_arr(ic,jcm1,k,Rho_comp) + rho_arr(ic,jc,k,Rho_comp)), Real(1.e-16));
+                        } else {
+                            rho = amrex::max(rho_arr(ic,jc,k,Rho_comp), Real(1.e-16));
+                        }
+
+                        Real delta = targ(i,j,k,0) - data_arr(i,j,k,icomp);
+                        Real Factor = Real(0.0);
+                        bool apply = true;
+
+                        if (sname[0] == 'x') {
+                            Real x = ProbLo[0] + (i + ioff) * dx[0];
+                            Real y = ProbLo[1] + (j + joff) * dx[1];
+                            Real y_end  = ProbLo[1] + width * dx[1];
+                            Real y_strt = ProbHi[1] - width * dx[1];
+                            Real eta_lo = (y < y_end ) ? (y_end  - y) / (y_end  - ProbLo[1]) : zero;
+                            Real eta_hi = (y > y_strt) ? (y - y_strt) / (ProbHi[1] - y_strt) : zero;
+                            Real eta    = amrex::max(eta_lo,eta_hi);
+                            if (dbg_nudge_exclude_x_corners && eta > zero) { apply = false; }
+
+                            if (sname[2] == 'o') { // xlo
+                                Real x_end = ProbLo[0] + width * dx[0];
+                                Real xi = (x_end - x) / (x_end - ProbLo[0]);
+                                Factor = amrex::max(xi*xi, eta*eta);
+                                if (dbg_nudge_const_factor >= zero) { Factor = dbg_nudge_const_factor; }
+                                if (do_upwind) {
+                                    int jju = amrex::min(amrex::max(j,dom_cc_lo.y),dom_cc_hi.y);
+                                    int iiv = amrex::min(amrex::max(i,dom_cc_lo.x),dom_cc_hi.x);
+                                    bool up_ok =
+                                        (u_xlo(dom_cc_lo.x,jju,k) >= zero) ||
+                                        ((j == dom_cc_lo.y      ) && (v_xlo(iiv,dom_cc_lo.y  ,k) >= zero)) ||
+                                        ((j == dom_cc_hi.y+iv[1]) && (v_xlo(iiv,dom_cc_hi.y+1,k) <= zero));
+                                    apply = apply && up_ok;
+                                }
+                            } else { // xhi
+                                Real x_strt = ProbHi[0] - width * dx[0];
+                                Real xi = (x - x_strt) / (ProbHi[0] - x_strt);
+                                Factor = amrex::max(xi*xi, eta*eta);
+                                if (dbg_nudge_const_factor >= zero) { Factor = dbg_nudge_const_factor; }
+                                if (do_upwind) {
+                                    int jju = amrex::min(amrex::max(j,dom_cc_lo.y),dom_cc_hi.y);
+                                    int iiv = amrex::min(amrex::max(i,dom_cc_lo.x),dom_cc_hi.x);
+                                    bool up_ok =
+                                        (u_xhi(dom_cc_hi.x+1,jju,k) <= zero) ||
+                                        ((j == dom_cc_lo.y      ) && (v_xhi(iiv,dom_cc_lo.y  ,k) >= zero)) ||
+                                        ((j == dom_cc_hi.y+iv[1]) && (v_xhi(iiv,dom_cc_hi.y+1,k) <= zero));
+                                    apply = apply && up_ok;
+                                }
+                            }
+                        } else { // y-side
+                            Real y = ProbLo[1] + (j + joff) * dx[1];
+                            if (sname[2] == 'o') { // ylo
+                                Real y_end = ProbLo[1] + width * dx[1];
+                                Real eta = (y_end - y) / (y_end - ProbLo[1]);
+                                Factor = eta*eta;
+                                if (dbg_nudge_const_factor >= zero) { Factor = dbg_nudge_const_factor; }
+                                if (do_upwind) {
+                                    int iiv = amrex::min(amrex::max(i,dom_cc_lo.x+width),dom_cc_hi.x-width);
+                                    apply = (v_ylo(iiv,dom_cc_lo.y,k) >= zero);
+                                }
+                            } else { // yhi
+                                Real y_strt = ProbHi[1] - width * dx[1];
+                                Real eta = (y - y_strt) / (ProbHi[1] - y_strt);
+                                Factor = eta*eta;
+                                if (dbg_nudge_const_factor >= zero) { Factor = dbg_nudge_const_factor; }
+                                if (do_upwind) {
+                                    int iiv = amrex::min(amrex::max(i,dom_cc_lo.x+width),dom_cc_hi.x-width);
+                                    apply = (v_yhi(iiv,dom_cc_hi.y+1,k) >= zero);
+                                }
+                            }
+                        }
+
+                        if (!apply) {
+                            return {Real(0.0), Real(0.0), Long(0),
+                                    Real(0.0), Real(0.0), Long(1)};
+                        }
+                        Real temp  = nudge_scale * Factor * F1 * delta;
+                        Real tdp   = temp / rho;
+                        return {temp, std::abs(temp), Long(1),
+                                tdp, std::abs(tdp), Long(1)};
+                    });
+                    auto hv = rdata.value();
+                    Real sum_temp    = amrex::get<0>(hv);
+                    Real maxabs_temp = amrex::get<1>(hv);
+                    Long n_apply     = amrex::get<2>(hv);
+                    Real sum_tdp     = amrex::get<3>(hv);
+                    Real maxabs_tdp  = amrex::get<4>(hv);
+                    Long n_eval      = amrex::get<5>(hv);
+                    if (n_eval > 0) {
+                        const int my_rank = ParallelDescriptor::MyProc();
+                        amrex::AllPrint() << "[DBG_TEND " << dbg_var << "]"
+                                          << " rank=" << my_rank
+                                          << " t=" << time
+                                          << " t_elapsed=" << (time-start_bdy_time)
+                                          << " bdy_idx=" << n_time
+                                          << " side=" << sname
+                                          << " width=" << width
+                                          << " n_eval=" << n_eval
+                                          << " n_apply=" << n_apply
+                                          << " mean_temp=" << (n_apply > 0 ? sum_temp/Real(n_apply) : Real(0.0))
+                                          << " maxabs_temp=" << (n_apply > 0 ? maxabs_temp : Real(0.0))
+                                          << " mean_tdp=" << (n_apply > 0 ? sum_tdp/Real(n_apply) : Real(0.0))
+                                          << " maxabs_tdp=" << (n_apply > 0 ? maxabs_tdp : Real(0.0))
+                                          << "\n";
+                    }
+                };
+
+                print_stats_for_side(tbx_xlo, arr_xlo, "xlo");
+                print_stats_for_side(tbx_xhi, arr_xhi, "xhi");
+                print_stats_for_side(tbx_ylo, arr_ylo, "ylo");
+                print_stats_for_side(tbx_yhi, arr_yhi, "yhi");
+                if (ivar == ivarV) {
+                    print_xside_corner_split(tbx_xlo, arr_xlo, "xlo");
+                    print_xside_corner_split(tbx_xhi, arr_xhi, "xhi");
+                    print_xside_setrelax_split(tbx_xlo, arr_xlo, false, "xlo");
+                    print_xside_setrelax_split(tbx_xhi, arr_xhi, true, "xhi");
+                    print_tend_for_side(tbx_xlo, arr_xlo, "xlo");
+                    print_tend_for_side(tbx_xhi, arr_xhi, "xhi");
+                    print_tend_for_side(tbx_ylo, arr_ylo, "ylo");
+                    print_tend_for_side(tbx_yhi, arr_yhi, "yhi");
+                }
+
+                scan_box_for_location(tbx_xlo, arr_xlo, 0);
+                scan_box_for_location(tbx_xhi, arr_xhi, 1);
+                scan_box_for_location(tbx_ylo, arr_ylo, 2);
+                scan_box_for_location(tbx_yhi, arr_yhi, 3);
+
+                // Compare theta in boundary band vs interior at top and bottom levels.
+                auto reduce_band_stats_at_k = [&](int ksel,
+                                                  Real& sum_bnd, Real& min_bnd, Real& max_bnd, Long& n_bnd,
+                                                  Real& sum_int, Real& min_int, Real& max_int, Long& n_int)
+                {
+                    Box pbx = mfi.validbox();
+                    pbx.setSmall(2, ksel);
+                    pbx.setBig  (2, ksel);
+                    if (!pbx.ok()) { return; }
+                    ReduceOps<ReduceOpSum,ReduceOpMin,ReduceOpMax,ReduceOpSum,
+                              ReduceOpSum,ReduceOpMin,ReduceOpMax,ReduceOpSum> rop;
+                    ReduceData<Real,Real,Real,Long,Real,Real,Real,Long> rdata(rop);
+                    using RT = typename decltype(rdata)::Type;
+                    rop.eval(pbx, rdata, [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept -> RT
+                    {
+                        Real rho = amrex::max(rho_arr(i,j,k,Rho_comp), Real(1.e-16));
+                        Real thp = data_arr(i,j,k,icomp) / rho;
+                        bool is_bnd = (i < dom3.x + width) || (i > domh.x - width) ||
+                                      (j < dom3.y + width) || (j > domh.y - width);
+                        if (is_bnd) {
+                            return {thp, thp, thp, Long(1),
+                                    Real(0.0), std::numeric_limits<Real>::max(), -std::numeric_limits<Real>::max(), Long(0)};
+                        } else {
+                            return {Real(0.0), std::numeric_limits<Real>::max(), -std::numeric_limits<Real>::max(), Long(0),
+                                    thp, thp, thp, Long(1)};
+                        }
+                    });
+                    auto hv = rdata.value();
+                    sum_bnd += amrex::get<0>(hv);
+                    min_bnd  = std::min(min_bnd, amrex::get<1>(hv));
+                    max_bnd  = std::max(max_bnd, amrex::get<2>(hv));
+                    n_bnd   += amrex::get<3>(hv);
+                    sum_int += amrex::get<4>(hv);
+                    min_int  = std::min(min_int, amrex::get<5>(hv));
+                    max_int  = std::max(max_int, amrex::get<6>(hv));
+                    n_int   += amrex::get<7>(hv);
+                };
+                reduce_band_stats_at_k(ktop,
+                                       sum_top_bnd, min_top_bnd, max_top_bnd, n_top_bnd,
+                                       sum_top_int, min_top_int, max_top_int, n_top_int);
+                reduce_band_stats_at_k(dom3.z,
+                                       sum_bot_bnd, min_bot_bnd, max_bot_bnd, n_bot_bnd,
+                                       sum_bot_int, min_bot_int, max_bot_int, n_bot_int);
+            }
+
+            Real nudge_factor_local = nudge_factor;
+            if (ivar == ivarU || ivar == ivarV) {
+                if (dbg_nudge_factor_uv > Real(0.0)) { nudge_factor_local = dbg_nudge_factor_uv; }
+            } else if (ivar == ivarT) {
+                if (dbg_nudge_factor_tq > Real(0.0)) { nudge_factor_local = dbg_nudge_factor_tq; }
+            }
+            const Real F1_local = one / (nudge_factor_local * delta_t);
+
             realbdy_compute_relaxation(icomp, 1,
-                                       width, dx, ProbLo, ProbHi, F1, geom.Domain(),
+                                       width, dx, ProbLo, ProbHi, F1_local, geom.Domain(),
                                        tbx_xlo , tbx_xhi , tbx_ylo , tbx_yhi ,
                                        arr_xlo , arr_xhi , arr_ylo , arr_yhi ,
                                        u_xlo, u_xhi, v_xlo, v_xhi, v_ylo, v_yhi,
-                                       data_arr, rhs_arr, do_upwind);
+                                       rho_cc_arr,
+                                       data_arr, rhs_arr, nudge_scale, dbg_nudge_x, dbg_nudge_y,
+                                       dbg_nudge_exclude_x_corners, dbg_nudge_const_factor, do_upwind,
+                                       y_face_owns_corners, dbg_realbdy_yface_corner_use_max_metric,
+                                       dbg_realbdy_use_primitive_delta,
+                                       dbg_realbdy_weight_profile_id, dbg_realbdy_weight_tanh_beta);
 
             /*
             // UNIT TEST DEBUG
@@ -480,6 +1067,104 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
             });
             */
         } // mfi
+
+        if ((dbg_nudge_print_stats &&
+             (ivar == ivarV || (ivar == ivarT && !dbg_nudge_print_v_only)) &&
+             ((ivar == ivarV) || ParallelDescriptor::IOProcessor())) ||
+            (dbg_tend_v_print && ivar == ivarV) ) {
+            const char* dbg_var = (ivar == ivarT) ? "theta" : "v";
+            static const char* sname[NSIDES] = {"xlo","xhi","ylo","yhi"};
+            const int my_rank = ParallelDescriptor::MyProc();
+            for (int s=0; s<NSIDES; ++s) {
+                if (best_absdp[s] >= 0.0) {
+                    if (ivar == ivarV) {
+                        amrex::AllPrint() << "[DBG_NUDGE " << dbg_var << "_loc]"
+                                          << " rank=" << my_rank
+                                          << " t=" << time
+                                          << " t_elapsed=" << (time-start_bdy_time)
+                                          << " bdy_idx=" << n_time
+                                          << " side=" << sname[s]
+                                          << " i=" << best_i[s]
+                                          << " j=" << best_j[s]
+                                          << " k=" << best_k[s]
+                                          << " dc=" << best_dc[s]
+                                          << " dp=" << best_dp[s]
+                                          << " absdp=" << best_absdp[s]
+                                          << " state_p=" << best_statep[s]
+                                          << " targ_p=" << best_targp[s]
+                                          << " rho=" << best_rho[s]
+                                          << "\n";
+                    } else {
+                        Print() << "[DBG_NUDGE " << dbg_var << "_loc]"
+                                << " rank=" << my_rank
+                                << " t=" << time
+                                << " t_elapsed=" << (time-start_bdy_time)
+                                << " bdy_idx=" << n_time
+                                << " side=" << sname[s]
+                                << " i=" << best_i[s]
+                                << " j=" << best_j[s]
+                                << " k=" << best_k[s]
+                                << " dc=" << best_dc[s]
+                                << " dp=" << best_dp[s]
+                                << " absdp=" << best_absdp[s]
+                                << " state_p=" << best_statep[s]
+                                << " targ_p=" << best_targp[s]
+                                << " rho=" << best_rho[s]
+                                << "\n";
+                    }
+                }
+            }
+        }
+
+        if (dbg_nudge_print_stats && ivar == ivarT && !dbg_nudge_print_v_only) {
+            ParallelDescriptor::ReduceRealSum(sum_top_bnd);
+            ParallelDescriptor::ReduceRealMin(min_top_bnd);
+            ParallelDescriptor::ReduceRealMax(max_top_bnd);
+            ParallelDescriptor::ReduceLongSum(n_top_bnd);
+            ParallelDescriptor::ReduceRealSum(sum_top_int);
+            ParallelDescriptor::ReduceRealMin(min_top_int);
+            ParallelDescriptor::ReduceRealMax(max_top_int);
+            ParallelDescriptor::ReduceLongSum(n_top_int);
+            ParallelDescriptor::ReduceRealSum(sum_bot_bnd);
+            ParallelDescriptor::ReduceRealMin(min_bot_bnd);
+            ParallelDescriptor::ReduceRealMax(max_bot_bnd);
+            ParallelDescriptor::ReduceLongSum(n_bot_bnd);
+            ParallelDescriptor::ReduceRealSum(sum_bot_int);
+            ParallelDescriptor::ReduceRealMin(min_bot_int);
+            ParallelDescriptor::ReduceRealMax(max_bot_int);
+            ParallelDescriptor::ReduceLongSum(n_bot_int);
+
+            if (ParallelDescriptor::IOProcessor()) {
+                Print() << "[DBG_NUDGE theta_top_band]"
+                        << " t=" << time
+                        << " t_elapsed=" << (time-start_bdy_time)
+                        << " bdy_idx=" << n_time
+                        << " ktop=" << ubound(geom.Domain()).z
+                        << " bnd_mean=" << (n_top_bnd > 0 ? sum_top_bnd/Real(n_top_bnd) : Real(0.0))
+                        << " bnd_min=" << (n_top_bnd > 0 ? min_top_bnd : Real(0.0))
+                        << " bnd_max=" << (n_top_bnd > 0 ? max_top_bnd : Real(0.0))
+                        << " bnd_n=" << n_top_bnd
+                        << " int_mean=" << (n_top_int > 0 ? sum_top_int/Real(n_top_int) : Real(0.0))
+                        << " int_min=" << (n_top_int > 0 ? min_top_int : Real(0.0))
+                        << " int_max=" << (n_top_int > 0 ? max_top_int : Real(0.0))
+                        << " int_n=" << n_top_int
+                        << "\n";
+                Print() << "[DBG_NUDGE theta_bot_band]"
+                        << " t=" << time
+                        << " t_elapsed=" << (time-start_bdy_time)
+                        << " bdy_idx=" << n_time
+                        << " kbot=" << lbound(geom.Domain()).z
+                        << " bnd_mean=" << (n_bot_bnd > 0 ? sum_bot_bnd/Real(n_bot_bnd) : Real(0.0))
+                        << " bnd_min=" << (n_bot_bnd > 0 ? min_bot_bnd : Real(0.0))
+                        << " bnd_max=" << (n_bot_bnd > 0 ? max_bot_bnd : Real(0.0))
+                        << " bnd_n=" << n_bot_bnd
+                        << " int_mean=" << (n_bot_int > 0 ? sum_bot_int/Real(n_bot_int) : Real(0.0))
+                        << " int_min=" << (n_bot_int > 0 ? min_bot_int : Real(0.0))
+                        << " int_max=" << (n_bot_int > 0 ? max_bot_int : Real(0.0))
+                        << " int_n=" << n_bot_int
+                        << "\n";
+            }
+        }
     } // ivar
     //ParallelDescriptor::Barrier();
     //exit(0);
@@ -791,4 +1476,3 @@ fine_compute_interior_ghost_rhs (const Real& time,
         } // mfi
     } // ivar_idx
 }
-

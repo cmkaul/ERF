@@ -30,6 +30,60 @@ moist_set_rhs (const Geometry& geom,
                Vector<Vector<FArrayBox>>& bdy_data_yhi,
                std::unique_ptr<ReadBndryPlanes>& m_r2d)
 {
+    // Debug controls for isolating real-boundary nudging behavior.
+    static bool dbg_flags_init = false;
+    static bool dbg_nudge_tq = true;
+    static bool dbg_nudge_x = true;
+    static bool dbg_nudge_y = true;
+    static bool dbg_nudge_print_stats = false;
+    static bool dbg_nudge_freeze_alpha = false;
+    static bool dbg_nudge_exclude_x_corners = false;
+    static bool dbg_realbdy_yface_corner_owner = false;
+    static bool dbg_realbdy_component_corner_owner = false;
+    static bool dbg_realbdy_yface_corner_use_max_metric = true;
+    static bool dbg_realbdy_use_primitive_delta = false;
+    static std::string dbg_realbdy_weight_profile = "quadratic";
+    static int dbg_realbdy_weight_profile_id = 0; // 0=quadratic,1=cosine,2=tanh
+    static Real dbg_realbdy_weight_tanh_beta = Real(2.5);
+    static Real dbg_nudge_const_factor = Real(-1.0);
+    static Real dbg_nudge_factor_tq = Real(-1.0);
+    if (!dbg_flags_init) {
+        ParmParse pp("erf");
+        pp.query("dbg_nudge_tq", dbg_nudge_tq);
+        pp.query("dbg_nudge_x",  dbg_nudge_x);
+        pp.query("dbg_nudge_y",  dbg_nudge_y);
+        pp.query("dbg_nudge_print_stats", dbg_nudge_print_stats);
+        pp.query("dbg_nudge_freeze_alpha", dbg_nudge_freeze_alpha);
+        pp.query("dbg_nudge_exclude_x_corners", dbg_nudge_exclude_x_corners);
+        pp.query("dbg_realbdy_yface_corner_owner", dbg_realbdy_yface_corner_owner);
+        pp.query("dbg_realbdy_component_corner_owner", dbg_realbdy_component_corner_owner);
+        pp.query("dbg_realbdy_yface_corner_use_max_metric", dbg_realbdy_yface_corner_use_max_metric);
+        pp.query("dbg_realbdy_use_primitive_delta", dbg_realbdy_use_primitive_delta);
+        pp.query("dbg_realbdy_weight_profile", dbg_realbdy_weight_profile);
+        pp.query("dbg_realbdy_weight_tanh_beta", dbg_realbdy_weight_tanh_beta);
+        pp.query("dbg_nudge_const_factor", dbg_nudge_const_factor);
+        pp.query("dbg_nudge_factor_tq", dbg_nudge_factor_tq);
+
+        if (dbg_realbdy_weight_profile == "quadratic" || dbg_realbdy_weight_profile == "quad") {
+            dbg_realbdy_weight_profile_id = 0;
+        } else if (dbg_realbdy_weight_profile == "cosine" || dbg_realbdy_weight_profile == "cos") {
+            dbg_realbdy_weight_profile_id = 1;
+        } else if (dbg_realbdy_weight_profile == "tanh") {
+            dbg_realbdy_weight_profile_id = 2;
+        } else {
+            if (ParallelDescriptor::IOProcessor()) {
+                Print() << "WARNING: Unknown erf.dbg_realbdy_weight_profile='"
+                        << dbg_realbdy_weight_profile
+                        << "'. Falling back to 'quadratic'.\n";
+            }
+            dbg_realbdy_weight_profile_id = 0;
+            dbg_realbdy_weight_profile = "quadratic";
+        }
+        dbg_flags_init = true;
+    }
+    bool y_face_owns_corners = dbg_realbdy_component_corner_owner ? false : dbg_realbdy_yface_corner_owner;
+    Real nudge_scale = dbg_nudge_tq ? Real(1.0) : Real(0.0);
+
     // HACK HACK HACK
     // Get bndry data
     int bdy_comp = BCVars::RhoQ1_bc_comp;
@@ -48,7 +102,9 @@ moist_set_rhs (const Geometry& geom,
     //
 
     // Relaxation constants
-    Real F1 = one/(nudge_factor*dt);
+    Real nudge_factor_local = nudge_factor;
+    if (dbg_nudge_factor_tq > Real(0.0)) { nudge_factor_local = dbg_nudge_factor_tq; }
+    Real F1 = one/(nudge_factor_local*dt);
 
     // Domain bounds
     const auto& dom_hi = ubound(domain);
@@ -73,6 +129,10 @@ moist_set_rhs (const Geometry& geom,
 
     AMREX_ALWAYS_ASSERT( alpha >= zero && alpha <= one);
     Real oma   = one - alpha;
+    if (dbg_nudge_freeze_alpha) {
+        oma = one;
+        alpha = zero;
+    }
 
     /*
     // UNIT TEST DEBUG
@@ -91,7 +151,8 @@ moist_set_rhs (const Geometry& geom,
     realbdy_interior_bxs_xy(gdom, domain, width,
                             bx_xlo, bx_xhi,
                             bx_ylo, bx_yhi,
-                            ng_vect, true);
+                            ng_vect, true,
+                            y_face_owns_corners);
 
     // Temporary FABs for storage (owned/filled on all ranks)
     FArrayBox QV_xlo, QV_xhi, QV_ylo, QV_yhi;
@@ -146,7 +207,8 @@ moist_set_rhs (const Geometry& geom,
     realbdy_interior_bxs_xy(gtbx, domain, width,
                             tbx_xlo, tbx_xhi,
                             tbx_ylo, tbx_yhi,
-                            ng_vect, true);
+                            ng_vect, true,
+                            y_face_owns_corners);
 
     // Limiting offset
     int offset = width - 1;
@@ -157,9 +219,15 @@ moist_set_rhs (const Geometry& geom,
     {
         int ii = std::min(std::max(i , dom_lo.x), dom_lo.x+offset);
         int jj = std::min(std::max(j , dom_lo.y), dom_hi.y       );
-        arr_xlo(i,j,k) = (bdatxlo) ? new_cons(i,j,k,Rho_comp) * bdatxlo(ii,jj,k,bdy_comp) :
-            new_cons(i,j,k,Rho_comp) * ( oma   * bdatxlo_n  (ii,jj,k)
-                                       + alpha * bdatxlo_np1(ii,jj,k) );
+        Real rho = new_cons(i,j,k,Rho_comp);
+        Real qv_t = (bdatxlo) ? bdatxlo(ii,jj,k,bdy_comp)
+                              : ( oma * bdatxlo_n(ii,jj,k) + alpha * bdatxlo_np1(ii,jj,k) );
+        if (dbg_realbdy_use_primitive_delta) {
+            Real qv_c = new_cons(i,j,k,RhoQ1_comp) / amrex::max(rho, Real(1.e-16));
+            arr_xlo(i,j,k) = new_cons(i,j,k,RhoQ1_comp) + rho * (qv_t - qv_c);
+        } else {
+            arr_xlo(i,j,k) = rho * qv_t;
+        }
         u_xlo(i,j,k) = ( oma * bdatxlo_n_u(ii,jj,k) + alpha * bdatxlo_np1_u(ii,jj,k) );
         v_xlo(i,j,k) = ( oma * bdatxlo_n_v(ii,jj,k) + alpha * bdatxlo_np1_v(ii,jj,k) );
         if (j == dom_hi.y) {
@@ -171,9 +239,15 @@ moist_set_rhs (const Geometry& geom,
     {
         int ii = std::min(std::max(i , dom_hi.x-offset), dom_hi.x);
         int jj = std::min(std::max(j , dom_lo.y       ), dom_hi.y);
-        arr_xhi(i,j,k) = (bdatxhi) ? new_cons(i,j,k,Rho_comp) * bdatxhi(ii,jj,k,bdy_comp) :
-            new_cons(i,j,k,Rho_comp) * ( oma   * bdatxhi_n  (ii,jj,k)
-                                       + alpha * bdatxhi_np1(ii,jj,k) );
+        Real rho = new_cons(i,j,k,Rho_comp);
+        Real qv_t = (bdatxhi) ? bdatxhi(ii,jj,k,bdy_comp)
+                              : ( oma * bdatxhi_n(ii,jj,k) + alpha * bdatxhi_np1(ii,jj,k) );
+        if (dbg_realbdy_use_primitive_delta) {
+            Real qv_c = new_cons(i,j,k,RhoQ1_comp) / amrex::max(rho, Real(1.e-16));
+            arr_xhi(i,j,k) = new_cons(i,j,k,RhoQ1_comp) + rho * (qv_t - qv_c);
+        } else {
+            arr_xhi(i,j,k) = rho * qv_t;
+        }
         // NOTE: correct for idx type mismatch with u bdy data
         u_xhi(i+1,j,k) = ( oma * bdatxhi_n_u(ii+1,jj,k) + alpha * bdatxhi_np1_u(ii+1,jj,k) );
         v_xhi(i  ,j,k) = ( oma * bdatxhi_n_v(ii  ,jj,k) + alpha * bdatxhi_np1_v(ii,jj,k) );
@@ -188,9 +262,15 @@ moist_set_rhs (const Geometry& geom,
     {
         int ii = std::min(std::max(i , dom_lo.x), dom_hi.x       );
         int jj = std::min(std::max(j , dom_lo.y), dom_lo.y+offset);
-        arr_ylo(i,j,k) = (bdatylo) ? new_cons(i,j,k,Rho_comp) * bdatylo(ii,jj,k,bdy_comp) :
-            new_cons(i,j,k,Rho_comp) * ( oma   * bdatylo_n  (ii,jj,k)
-                                       + alpha * bdatylo_np1(ii,jj,k) );
+        Real rho = new_cons(i,j,k,Rho_comp);
+        Real qv_t = (bdatylo) ? bdatylo(ii,jj,k,bdy_comp)
+                              : ( oma * bdatylo_n(ii,jj,k) + alpha * bdatylo_np1(ii,jj,k) );
+        if (dbg_realbdy_use_primitive_delta) {
+            Real qv_c = new_cons(i,j,k,RhoQ1_comp) / amrex::max(rho, Real(1.e-16));
+            arr_ylo(i,j,k) = new_cons(i,j,k,RhoQ1_comp) + rho * (qv_t - qv_c);
+        } else {
+            arr_ylo(i,j,k) = rho * qv_t;
+        }
         v_ylo(i,j,k) = ( oma * bdatylo_n_v(ii,jj,k) + alpha * bdatylo_np1_v(ii,jj,k) );
     },
     [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept
@@ -198,9 +278,15 @@ moist_set_rhs (const Geometry& geom,
         int ii = std::min(std::max(i , dom_lo.x       ), dom_hi.x);
         int jj = std::min(std::max(j , dom_hi.y-offset), dom_hi.y);
             jj = std::min(jj, dom_hi.y);
-            arr_yhi(i,j,k) = (bdatyhi) ? new_cons(i,j,k,Rho_comp) * bdatyhi(ii,jj,k,bdy_comp) :
-                new_cons(i,j,k,Rho_comp) * ( oma   * bdatyhi_n  (ii,jj,k)
-                                           + alpha * bdatyhi_np1(ii,jj,k) );
+        Real rho = new_cons(i,j,k,Rho_comp);
+        Real qv_t = (bdatyhi) ? bdatyhi(ii,jj,k,bdy_comp)
+                              : ( oma * bdatyhi_n(ii,jj,k) + alpha * bdatyhi_np1(ii,jj,k) );
+        if (dbg_realbdy_use_primitive_delta) {
+            Real qv_c = new_cons(i,j,k,RhoQ1_comp) / amrex::max(rho, Real(1.e-16));
+            arr_yhi(i,j,k) = new_cons(i,j,k,RhoQ1_comp) + rho * (qv_t - qv_c);
+        } else {
+            arr_yhi(i,j,k) = rho * qv_t;
+        }
         // NOTE: correct for idx type mismatch with v bdy data
         v_yhi(i,j+1,k) = ( oma * bdatyhi_n_v(ii,jj+1,k) + alpha * bdatyhi_np1_v(ii,jj+1,k) );
     });
@@ -211,13 +297,139 @@ moist_set_rhs (const Geometry& geom,
     realbdy_interior_bxs_xy(tbx, domain, width,
                             tbx_xlo, tbx_xhi,
                             tbx_ylo, tbx_yhi,
-                            ng_vect);
+                            ng_vect, false,
+                            y_face_owns_corners);
+
+    if (dbg_nudge_print_stats) {
+        auto print_stats_for_side = [&](const Box& bx, const Array4<Real>& targ, const char* sname)
+        {
+            if (!bx.ok()) return;
+            ReduceOps<ReduceOpSum, ReduceOpSum, ReduceOpMax, ReduceOpMax, ReduceOpMin, ReduceOpMax, ReduceOpSum> reduce_op;
+            ReduceData<Real, Real, Real, Real, Real, Real, Long> reduce_data(reduce_op);
+            using ReduceTuple = typename decltype(reduce_data)::Type;
+            reduce_op.eval(bx, reduce_data, [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept -> ReduceTuple
+            {
+                Real dc  = targ(i,j,k,0) - new_cons(i,j,k,RhoQ1_comp);
+                Real rho = amrex::max(new_cons(i,j,k,Rho_comp), Real(1.e-16));
+                Real dp  = dc / rho;
+                return {dc, dp, std::abs(dc), std::abs(dp), rho, rho, Long(1)};
+            });
+            auto hv = reduce_data.value();
+
+            Real sum_dc    = amrex::get<0>(hv);
+            Real sum_dp    = amrex::get<1>(hv);
+            Real maxabs_dc = amrex::get<2>(hv);
+            Real maxabs_dp = amrex::get<3>(hv);
+            Real rho_min   = amrex::get<4>(hv);
+            Real rho_max   = amrex::get<5>(hv);
+            Long n         = amrex::get<6>(hv);
+
+            ParallelDescriptor::ReduceRealSum(sum_dc);
+            ParallelDescriptor::ReduceRealSum(sum_dp);
+            ParallelDescriptor::ReduceRealMax(maxabs_dc);
+            ParallelDescriptor::ReduceRealMax(maxabs_dp);
+            ParallelDescriptor::ReduceRealMin(rho_min);
+            ParallelDescriptor::ReduceRealMax(rho_max);
+            ParallelDescriptor::ReduceLongSum(n);
+
+            if (ParallelDescriptor::IOProcessor() && n > 0) {
+                Print() << "[DBG_NUDGE qv]"
+                        << " t=" << time
+                        << " t_elapsed=" << (time-start_bdy_time)
+                        << " bdy_idx=" << n_time
+                        << " side=" << sname
+                        << " mean_dc=" << (sum_dc/Real(n))
+                        << " maxabs_dc=" << maxabs_dc
+                        << " mean_dp=" << (sum_dp/Real(n))
+                        << " maxabs_dp=" << maxabs_dp
+                        << " rho_min=" << rho_min
+                        << " rho_max=" << rho_max
+                        << " n=" << n
+                        << "\n";
+            }
+        };
+
+        print_stats_for_side(tbx_xlo, arr_xlo, "xlo");
+        print_stats_for_side(tbx_xhi, arr_xhi, "xhi");
+        print_stats_for_side(tbx_ylo, arr_ylo, "ylo");
+        print_stats_for_side(tbx_yhi, arr_yhi, "yhi");
+
+        auto print_qv_band = [&](int ksel, const char* tag)
+        {
+            Box pbx = tbx;
+            pbx.setSmall(2, ksel);
+            pbx.setBig  (2, ksel);
+            if (!pbx.ok()) return;
+
+            ReduceOps<ReduceOpSum,ReduceOpMin,ReduceOpMax,ReduceOpSum,
+                      ReduceOpSum,ReduceOpMin,ReduceOpMax,ReduceOpSum> rop;
+            ReduceData<Real,Real,Real,Long,Real,Real,Real,Long> rdata(rop);
+            using RT = typename decltype(rdata)::Type;
+            rop.eval(pbx, rdata, [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept -> RT
+            {
+                Real rho = amrex::max(new_cons(i,j,k,Rho_comp), Real(1.e-16));
+                Real qvp = new_cons(i,j,k,RhoQ1_comp) / rho;
+                bool is_bnd = (i < dom_lo.x + width) || (i > dom_hi.x - width) ||
+                              (j < dom_lo.y + width) || (j > dom_hi.y - width);
+                if (is_bnd) {
+                    return {qvp, qvp, qvp, Long(1),
+                            Real(0.0), std::numeric_limits<Real>::max(), -std::numeric_limits<Real>::max(), Long(0)};
+                } else {
+                    return {Real(0.0), std::numeric_limits<Real>::max(), -std::numeric_limits<Real>::max(), Long(0),
+                            qvp, qvp, qvp, Long(1)};
+                }
+            });
+            auto hv = rdata.value();
+            Real sum_b = amrex::get<0>(hv);
+            Real min_b = amrex::get<1>(hv);
+            Real max_b = amrex::get<2>(hv);
+            Long n_b   = amrex::get<3>(hv);
+            Real sum_i = amrex::get<4>(hv);
+            Real min_i = amrex::get<5>(hv);
+            Real max_i = amrex::get<6>(hv);
+            Long n_i   = amrex::get<7>(hv);
+
+            ParallelDescriptor::ReduceRealSum(sum_b);
+            ParallelDescriptor::ReduceRealMin(min_b);
+            ParallelDescriptor::ReduceRealMax(max_b);
+            ParallelDescriptor::ReduceLongSum(n_b);
+            ParallelDescriptor::ReduceRealSum(sum_i);
+            ParallelDescriptor::ReduceRealMin(min_i);
+            ParallelDescriptor::ReduceRealMax(max_i);
+            ParallelDescriptor::ReduceLongSum(n_i);
+
+            if (ParallelDescriptor::IOProcessor()) {
+                Print() << "[DBG_NUDGE " << tag << "]"
+                        << " t=" << time
+                        << " t_elapsed=" << (time-start_bdy_time)
+                        << " bdy_idx=" << n_time
+                        << " k=" << ksel
+                        << " bnd_mean=" << (n_b > 0 ? sum_b/Real(n_b) : Real(0.0))
+                        << " bnd_min=" << (n_b > 0 ? min_b : Real(0.0))
+                        << " bnd_max=" << (n_b > 0 ? max_b : Real(0.0))
+                        << " bnd_n=" << n_b
+                        << " int_mean=" << (n_i > 0 ? sum_i/Real(n_i) : Real(0.0))
+                        << " int_min=" << (n_i > 0 ? min_i : Real(0.0))
+                        << " int_max=" << (n_i > 0 ? max_i : Real(0.0))
+                        << " int_n=" << n_i
+                        << "\n";
+            }
+        };
+        print_qv_band(dom_lo.z, "qv_bot_band");
+        print_qv_band(dom_hi.z, "qv_top_band");
+    }
+
     realbdy_compute_relaxation(RhoQ1_comp, 1,
                                width, dx, ProbLo, ProbHi, F1, domain,
                                tbx_xlo , tbx_xhi , tbx_ylo , tbx_yhi ,
                                arr_xlo , arr_xhi , arr_ylo , arr_yhi ,
                                u_xlo, u_xhi, v_xlo, v_xhi, v_ylo, v_yhi,
-                               new_cons, cell_rhs, do_upwind);
+                               new_cons,
+                               new_cons, cell_rhs, nudge_scale, dbg_nudge_x, dbg_nudge_y,
+                               dbg_nudge_exclude_x_corners, dbg_nudge_const_factor, do_upwind,
+                               y_face_owns_corners, dbg_realbdy_yface_corner_use_max_metric,
+                               dbg_realbdy_use_primitive_delta,
+                               dbg_realbdy_weight_profile_id, dbg_realbdy_weight_tanh_beta);
 
     /*
     // UNIT TEST DEBUG
