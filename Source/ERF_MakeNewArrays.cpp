@@ -335,6 +335,10 @@ ERF::init_stuff (int lev, const BoxArray& ba, const DistributionMapping& dm,
     if (lev == 0) {
         mf_C1H = std::make_unique<MultiFab>(ba1d[lev],dm,1,IntVect(ng[0],ng[1],ng[2]));
         mf_C2H = std::make_unique<MultiFab>(ba1d[lev],dm,1,IntVect(ng[0],ng[1],ng[2]));
+        // C1F/C2F live on WRF full (w) levels, i.e. nodal in z.
+        mf_C1F = std::make_unique<MultiFab>(convert(ba1d[lev],IntVect(0,0,1)),dm,1,IntVect(ng[0],ng[1],ng[2]));
+        mf_C2F = std::make_unique<MultiFab>(convert(ba1d[lev],IntVect(0,0,1)),dm,1,IntVect(ng[0],ng[1],ng[2]));
+        mf_DNW = std::make_unique<MultiFab>(ba1d[lev],dm,1,IntVect(ng[0],ng[1],ng[2]));
         mf_MUB = std::make_unique<MultiFab>(ba2d[lev],dm,1,IntVect(ng[0],ng[1],ng[2]));
     }
 

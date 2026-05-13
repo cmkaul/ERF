@@ -14,3 +14,15 @@ message(STATUS "   Gold file directory           = ${ERF_TEST_GOLD_FILES_DIRECTO
 message(STATUS "   Extra SDM tests enabled       = ${ERF_TEST_ENABLE_EXTRA_SDM_TESTS}")
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/CTestList.cmake)
+
+# ---------------------------------------------------------------------------
+# Lightweight unit tests (host-only executables)
+# ---------------------------------------------------------------------------
+add_executable(erf_unit_realbdy_interp Unit/ERF_RealBdyInterpUnit.cpp)
+target_include_directories(erf_unit_realbdy_interp PRIVATE
+  ${CMAKE_SOURCE_DIR}/Source
+  ${CMAKE_SOURCE_DIR}/Source/Utils
+)
+target_link_libraries(erf_unit_realbdy_interp PRIVATE amrex_3d)
+add_test(NAME ERF_RealBdyInterpUnit COMMAND $<TARGET_FILE:erf_unit_realbdy_interp>)
+set_tests_properties(ERF_RealBdyInterpUnit PROPERTIES LABELS "unit")

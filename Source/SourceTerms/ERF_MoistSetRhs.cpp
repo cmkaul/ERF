@@ -15,6 +15,11 @@ moist_set_rhs (const Geometry& geom,
                const Box& tbx,
                const Array4<Real const>& new_cons,
                const Array4<Real      >& cell_rhs,
+               const Array4<Real const>& mub_arr,
+               const Array4<Real const>& c1f_arr,
+               const Array4<Real const>& c2f_arr,
+               const Array4<Real const>& phb_arr,
+               const Array4<Real const>& zcc_arr,
                const Real& time,
                const Real& dt,
                const Real& start_bdy_time,
@@ -41,7 +46,8 @@ moist_set_rhs (const Geometry& geom,
     static bool dbg_realbdy_yface_corner_owner = false;
     static bool dbg_realbdy_component_corner_owner = false;
     static bool dbg_realbdy_yface_corner_use_max_metric = true;
-    static bool dbg_realbdy_use_primitive_delta = false;
+    static bool realbdy_vertical_remap_theta = false;
+    static int realbdy_vertical_remap_mode = 1; // 1=A-2 (default), 2=B, 3=C, 4=D
     static std::string dbg_realbdy_weight_profile = "quadratic";
     static int dbg_realbdy_weight_profile_id = 0; // 0=quadratic,1=cosine,2=tanh
     static Real dbg_realbdy_weight_tanh_beta = Real(2.5);
@@ -58,7 +64,8 @@ moist_set_rhs (const Geometry& geom,
         pp.query("dbg_realbdy_yface_corner_owner", dbg_realbdy_yface_corner_owner);
         pp.query("dbg_realbdy_component_corner_owner", dbg_realbdy_component_corner_owner);
         pp.query("dbg_realbdy_yface_corner_use_max_metric", dbg_realbdy_yface_corner_use_max_metric);
-        pp.query("dbg_realbdy_use_primitive_delta", dbg_realbdy_use_primitive_delta);
+        pp.query("realbdy_vertical_remap_theta", realbdy_vertical_remap_theta);
+        pp.query("realbdy_vertical_remap_mode", realbdy_vertical_remap_mode);
         pp.query("dbg_realbdy_weight_profile", dbg_realbdy_weight_profile);
         pp.query("dbg_realbdy_weight_tanh_beta", dbg_realbdy_weight_tanh_beta);
         pp.query("dbg_nudge_const_factor", dbg_nudge_const_factor);
@@ -78,6 +85,17 @@ moist_set_rhs (const Geometry& geom,
             }
             dbg_realbdy_weight_profile_id = 0;
             dbg_realbdy_weight_profile = "quadratic";
+        }
+        if (realbdy_vertical_remap_mode != 1 &&
+            realbdy_vertical_remap_mode != 2 &&
+            realbdy_vertical_remap_mode != 3 &&
+            realbdy_vertical_remap_mode != 4) {
+            if (ParallelDescriptor::IOProcessor()) {
+                Print() << "WARNING: Unknown erf.realbdy_vertical_remap_mode="
+                        << realbdy_vertical_remap_mode
+                        << ". Falling back to mode=1 (A-2).\n";
+            }
+            realbdy_vertical_remap_mode = 1;
         }
         dbg_flags_init = true;
     }
@@ -132,6 +150,20 @@ moist_set_rhs (const Geometry& geom,
     if (dbg_nudge_freeze_alpha) {
         oma = one;
         alpha = zero;
+    }
+    const bool have_wrfbdy_ph = (bdy_data_xlo[n_time].size() > WRFBdyVars::PH &&
+                                 bdy_data_xlo[n_time_p1].size() > WRFBdyVars::PH);
+    const bool use_qv_vertical_remap = realbdy_vertical_remap_theta && have_wrfbdy_ph;
+    const bool use_qv_modeB = (realbdy_vertical_remap_mode == 2);
+    const bool use_qv_modeC = (realbdy_vertical_remap_mode == 3);
+    const bool use_qv_modeD = (realbdy_vertical_remap_mode == 4);
+    if (realbdy_vertical_remap_theta && !have_wrfbdy_ph && ParallelDescriptor::IOProcessor()) {
+        Print() << "[REALBDY qv-remap] PH boundary field unavailable; disabling qv vertical remap.\n";
+    }
+    if (use_qv_vertical_remap && (use_qv_modeB || use_qv_modeC || use_qv_modeD) && ParallelDescriptor::IOProcessor()) {
+        Print() << "[REALBDY qv-remap] mode=" << realbdy_vertical_remap_mode
+                << " selected; for cell-centered qv this uses the same "
+                << "cc remap operator as mode=1.\n";
     }
 
     /*
@@ -194,6 +226,31 @@ moist_set_rhs (const Geometry& geom,
     const auto& bdatyhi_n_v   = bdy_data_yhi[n_time   ][WRFBdyVars::V].const_array();
     const auto& bdatyhi_np1_v = bdy_data_yhi[n_time_p1][WRFBdyVars::V].const_array();
 
+    const auto& bdatxlo_mu_n   = bdy_data_xlo[n_time   ][WRFBdyVars::MU].const_array();
+    const auto& bdatxlo_mu_np1 = bdy_data_xlo[n_time_p1][WRFBdyVars::MU].const_array();
+    const auto& bdatxhi_mu_n   = bdy_data_xhi[n_time   ][WRFBdyVars::MU].const_array();
+    const auto& bdatxhi_mu_np1 = bdy_data_xhi[n_time_p1][WRFBdyVars::MU].const_array();
+    const auto& bdatylo_mu_n   = bdy_data_ylo[n_time   ][WRFBdyVars::MU].const_array();
+    const auto& bdatylo_mu_np1 = bdy_data_ylo[n_time_p1][WRFBdyVars::MU].const_array();
+    const auto& bdatyhi_mu_n   = bdy_data_yhi[n_time   ][WRFBdyVars::MU].const_array();
+    const auto& bdatyhi_mu_np1 = bdy_data_yhi[n_time_p1][WRFBdyVars::MU].const_array();
+    const auto& bdatxlo_ph_n   = have_wrfbdy_ph ? bdy_data_xlo[n_time   ][WRFBdyVars::PH].const_array() : bdy_data_xlo[n_time][WRFBdyVars::QV].const_array();
+    const auto& bdatxlo_ph_np1 = have_wrfbdy_ph ? bdy_data_xlo[n_time_p1][WRFBdyVars::PH].const_array() : bdy_data_xlo[n_time_p1][WRFBdyVars::QV].const_array();
+    const auto& bdatxhi_ph_n   = have_wrfbdy_ph ? bdy_data_xhi[n_time   ][WRFBdyVars::PH].const_array() : bdy_data_xhi[n_time][WRFBdyVars::QV].const_array();
+    const auto& bdatxhi_ph_np1 = have_wrfbdy_ph ? bdy_data_xhi[n_time_p1][WRFBdyVars::PH].const_array() : bdy_data_xhi[n_time_p1][WRFBdyVars::QV].const_array();
+    const auto& bdatylo_ph_n   = have_wrfbdy_ph ? bdy_data_ylo[n_time   ][WRFBdyVars::PH].const_array() : bdy_data_ylo[n_time][WRFBdyVars::QV].const_array();
+    const auto& bdatylo_ph_np1 = have_wrfbdy_ph ? bdy_data_ylo[n_time_p1][WRFBdyVars::PH].const_array() : bdy_data_ylo[n_time_p1][WRFBdyVars::QV].const_array();
+    const auto& bdatyhi_ph_n   = have_wrfbdy_ph ? bdy_data_yhi[n_time   ][WRFBdyVars::PH].const_array() : bdy_data_yhi[n_time][WRFBdyVars::QV].const_array();
+    const auto& bdatyhi_ph_np1 = have_wrfbdy_ph ? bdy_data_yhi[n_time_p1][WRFBdyVars::PH].const_array() : bdy_data_yhi[n_time_p1][WRFBdyVars::QV].const_array();
+    const int kmax_ph_xlo = have_wrfbdy_ph ? bdy_data_xlo[n_time][WRFBdyVars::PH].box().bigEnd(2) : dom_hi.z;
+    const int kmax_ph_xhi = have_wrfbdy_ph ? bdy_data_xhi[n_time][WRFBdyVars::PH].box().bigEnd(2) : dom_hi.z;
+    const int kmax_ph_ylo = have_wrfbdy_ph ? bdy_data_ylo[n_time][WRFBdyVars::PH].box().bigEnd(2) : dom_hi.z;
+    const int kmax_ph_yhi = have_wrfbdy_ph ? bdy_data_yhi[n_time][WRFBdyVars::PH].box().bigEnd(2) : dom_hi.z;
+    const int kmax_qv_xlo = bdy_data_xlo[n_time][WRFBdyVars::QV].box().bigEnd(2);
+    const int kmax_qv_xhi = bdy_data_xhi[n_time][WRFBdyVars::QV].box().bigEnd(2);
+    const int kmax_qv_ylo = bdy_data_ylo[n_time][WRFBdyVars::QV].box().bigEnd(2);
+    const int kmax_qv_yhi = bdy_data_yhi[n_time][WRFBdyVars::QV].box().bigEnd(2);
+
     // Get Array4 of interpolated values
     Array4<Real> arr_xlo = QV_xlo.array();  Array4<Real> arr_xhi = QV_xhi.array();
     Array4<Real> arr_ylo = QV_ylo.array();  Array4<Real> arr_yhi = QV_yhi.array();
@@ -212,7 +269,6 @@ moist_set_rhs (const Geometry& geom,
 
     // Limiting offset
     int offset = width - 1;
-    const bool use_primitive_delta = dbg_realbdy_use_primitive_delta;
 
     // Populate with interpolation (protect from ghost cells)
     ParallelFor(tbx_xlo, tbx_xhi,
@@ -221,14 +277,52 @@ moist_set_rhs (const Geometry& geom,
         int ii = std::min(std::max(i , dom_lo.x), dom_lo.x+offset);
         int jj = std::min(std::max(j , dom_lo.y), dom_hi.y       );
         Real rho = new_cons(i,j,k,Rho_comp);
-        Real qv_t = (bdatxlo) ? bdatxlo(ii,jj,k,bdy_comp)
-                              : ( oma * bdatxlo_n(ii,jj,k) + alpha * bdatxlo_np1(ii,jj,k) );
-        if (use_primitive_delta) {
-            Real qv_c = new_cons(i,j,k,RhoQ1_comp) / amrex::max(rho, Real(1.e-16));
-            arr_xlo(i,j,k) = new_cons(i,j,k,RhoQ1_comp) + rho * (qv_t - qv_c);
+        Real qv_t;
+        if (bdatxlo) {
+            qv_t = bdatxlo(ii,jj,k,bdy_comp);
         } else {
-            arr_xlo(i,j,k) = rho * qv_t;
+            Real qv_base = oma * bdatxlo_n(ii,jj,k) + alpha * bdatxlo_np1(ii,jj,k);
+            qv_t = qv_base;
+            if (use_qv_vertical_remap) {
+                // qv remap at cell centers. Modes 1/2 currently share the same operator
+                // because qv is already cell-centered in horizontal coordinates.
+                const int ksrc_max = amrex::min(kmax_qv_xlo, kmax_ph_xlo-1);
+                const int ii_cc = amrex::min(amrex::max(ii, dom_lo.x), dom_hi.x);
+                const int jj_cc = amrex::min(amrex::max(jj, dom_lo.y), dom_hi.y);
+                const Real z_state = zcc_arr(i,j,k,0);
+                auto z_target = [&](int kk) AMREX_GPU_DEVICE noexcept -> Real {
+                    Real mu_t = oma * bdatxlo_mu_n(ii_cc,jj_cc,0,0) + alpha * bdatxlo_mu_np1(ii_cc,jj_cc,0,0) + mub_arr(ii_cc,jj_cc,0);
+                    Real xmu_f = c1f_arr(0,0,kk,0) * mu_t + c2f_arr(0,0,kk,0);
+                    Real ph_t = oma * bdatxlo_ph_n(ii_cc,jj_cc,kk,0) + alpha * bdatxlo_ph_np1(ii_cc,jj_cc,kk,0);
+                    return (ph_t / xmu_f + phb_arr(ii_cc,jj_cc,kk,0)) / CONST_GRAV;
+                };
+                if (ksrc_max > 0) {
+                    Real z0 = Real(0.5) * (z_target(0) + z_target(1));
+                    Real q0 = oma * bdatxlo_n(ii,jj,0) + alpha * bdatxlo_np1(ii,jj,0);
+                    if (z_state <= z0) {
+                        qv_t = q0;
+                    } else {
+                        bool found = false;
+                        for (int kk = 0; kk < ksrc_max; ++kk) {
+                            Real zl = Real(0.5) * (z_target(kk) + z_target(kk+1));
+                            Real zh = Real(0.5) * (z_target(kk+1) + z_target(kk+2));
+                            if (z_state <= zh || kk == ksrc_max-1) {
+                                Real ql = oma * bdatxlo_n(ii,jj,kk) + alpha * bdatxlo_np1(ii,jj,kk);
+                                Real qh = oma * bdatxlo_n(ii,jj,kk+1) + alpha * bdatxlo_np1(ii,jj,kk+1);
+                                Real dz = amrex::max(zh-zl, Real(1.e-12));
+                                Real lam = (z_state - zl) / dz;
+                                lam = amrex::max(Real(0.0), amrex::min(Real(1.0), lam));
+                                qv_t = (Real(1.0)-lam)*ql + lam*qh;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) { qv_t = oma * bdatxlo_n(ii,jj,ksrc_max) + alpha * bdatxlo_np1(ii,jj,ksrc_max); }
+                    }
+                }
+            }
         }
+        arr_xlo(i,j,k) = rho * qv_t;
         u_xlo(i,j,k) = ( oma * bdatxlo_n_u(ii,jj,k) + alpha * bdatxlo_np1_u(ii,jj,k) );
         v_xlo(i,j,k) = ( oma * bdatxlo_n_v(ii,jj,k) + alpha * bdatxlo_np1_v(ii,jj,k) );
         if (j == dom_hi.y) {
@@ -241,14 +335,51 @@ moist_set_rhs (const Geometry& geom,
         int ii = std::min(std::max(i , dom_hi.x-offset), dom_hi.x);
         int jj = std::min(std::max(j , dom_lo.y       ), dom_hi.y);
         Real rho = new_cons(i,j,k,Rho_comp);
-        Real qv_t = (bdatxhi) ? bdatxhi(ii,jj,k,bdy_comp)
-                              : ( oma * bdatxhi_n(ii,jj,k) + alpha * bdatxhi_np1(ii,jj,k) );
-        if (use_primitive_delta) {
-            Real qv_c = new_cons(i,j,k,RhoQ1_comp) / amrex::max(rho, Real(1.e-16));
-            arr_xhi(i,j,k) = new_cons(i,j,k,RhoQ1_comp) + rho * (qv_t - qv_c);
+        Real qv_t;
+        if (bdatxhi) {
+            qv_t = bdatxhi(ii,jj,k,bdy_comp);
         } else {
-            arr_xhi(i,j,k) = rho * qv_t;
+            Real qv_base = oma * bdatxhi_n(ii,jj,k) + alpha * bdatxhi_np1(ii,jj,k);
+            qv_t = qv_base;
+            if (use_qv_vertical_remap) {
+                // qv remap at cell centers. Modes 1/2 currently share the same operator.
+                const int ksrc_max = amrex::min(kmax_qv_xhi, kmax_ph_xhi-1);
+                const int ii_cc = amrex::min(amrex::max(ii, dom_lo.x), dom_hi.x);
+                const int jj_cc = amrex::min(amrex::max(jj, dom_lo.y), dom_hi.y);
+                const Real z_state = zcc_arr(i,j,k,0);
+                auto z_target = [&](int kk) AMREX_GPU_DEVICE noexcept -> Real {
+                    Real mu_t = oma * bdatxhi_mu_n(ii_cc,jj_cc,0,0) + alpha * bdatxhi_mu_np1(ii_cc,jj_cc,0,0) + mub_arr(ii_cc,jj_cc,0);
+                    Real xmu_f = c1f_arr(0,0,kk,0) * mu_t + c2f_arr(0,0,kk,0);
+                    Real ph_t = oma * bdatxhi_ph_n(ii_cc,jj_cc,kk,0) + alpha * bdatxhi_ph_np1(ii_cc,jj_cc,kk,0);
+                    return (ph_t / xmu_f + phb_arr(ii_cc,jj_cc,kk,0)) / CONST_GRAV;
+                };
+                if (ksrc_max > 0) {
+                    Real z0 = Real(0.5) * (z_target(0) + z_target(1));
+                    Real q0 = oma * bdatxhi_n(ii,jj,0) + alpha * bdatxhi_np1(ii,jj,0);
+                    if (z_state <= z0) {
+                        qv_t = q0;
+                    } else {
+                        bool found = false;
+                        for (int kk = 0; kk < ksrc_max; ++kk) {
+                            Real zl = Real(0.5) * (z_target(kk) + z_target(kk+1));
+                            Real zh = Real(0.5) * (z_target(kk+1) + z_target(kk+2));
+                            if (z_state <= zh || kk == ksrc_max-1) {
+                                Real ql = oma * bdatxhi_n(ii,jj,kk) + alpha * bdatxhi_np1(ii,jj,kk);
+                                Real qh = oma * bdatxhi_n(ii,jj,kk+1) + alpha * bdatxhi_np1(ii,jj,kk+1);
+                                Real dz = amrex::max(zh-zl, Real(1.e-12));
+                                Real lam = (z_state - zl) / dz;
+                                lam = amrex::max(Real(0.0), amrex::min(Real(1.0), lam));
+                                qv_t = (Real(1.0)-lam)*ql + lam*qh;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) { qv_t = oma * bdatxhi_n(ii,jj,ksrc_max) + alpha * bdatxhi_np1(ii,jj,ksrc_max); }
+                    }
+                }
+            }
         }
+        arr_xhi(i,j,k) = rho * qv_t;
         // NOTE: correct for idx type mismatch with u bdy data
         u_xhi(i+1,j,k) = ( oma * bdatxhi_n_u(ii+1,jj,k) + alpha * bdatxhi_np1_u(ii+1,jj,k) );
         v_xhi(i  ,j,k) = ( oma * bdatxhi_n_v(ii  ,jj,k) + alpha * bdatxhi_np1_v(ii,jj,k) );
@@ -264,14 +395,51 @@ moist_set_rhs (const Geometry& geom,
         int ii = std::min(std::max(i , dom_lo.x), dom_hi.x       );
         int jj = std::min(std::max(j , dom_lo.y), dom_lo.y+offset);
         Real rho = new_cons(i,j,k,Rho_comp);
-        Real qv_t = (bdatylo) ? bdatylo(ii,jj,k,bdy_comp)
-                              : ( oma * bdatylo_n(ii,jj,k) + alpha * bdatylo_np1(ii,jj,k) );
-        if (use_primitive_delta) {
-            Real qv_c = new_cons(i,j,k,RhoQ1_comp) / amrex::max(rho, Real(1.e-16));
-            arr_ylo(i,j,k) = new_cons(i,j,k,RhoQ1_comp) + rho * (qv_t - qv_c);
+        Real qv_t;
+        if (bdatylo) {
+            qv_t = bdatylo(ii,jj,k,bdy_comp);
         } else {
-            arr_ylo(i,j,k) = rho * qv_t;
+            Real qv_base = oma * bdatylo_n(ii,jj,k) + alpha * bdatylo_np1(ii,jj,k);
+            qv_t = qv_base;
+            if (use_qv_vertical_remap) {
+                // qv remap at cell centers. Modes 1/2 currently share the same operator.
+                const int ksrc_max = amrex::min(kmax_qv_ylo, kmax_ph_ylo-1);
+                const int ii_cc = amrex::min(amrex::max(ii, dom_lo.x), dom_hi.x);
+                const int jj_cc = amrex::min(amrex::max(jj, dom_lo.y), dom_hi.y);
+                const Real z_state = zcc_arr(i,j,k,0);
+                auto z_target = [&](int kk) AMREX_GPU_DEVICE noexcept -> Real {
+                    Real mu_t = oma * bdatylo_mu_n(ii_cc,jj_cc,0,0) + alpha * bdatylo_mu_np1(ii_cc,jj_cc,0,0) + mub_arr(ii_cc,jj_cc,0);
+                    Real xmu_f = c1f_arr(0,0,kk,0) * mu_t + c2f_arr(0,0,kk,0);
+                    Real ph_t = oma * bdatylo_ph_n(ii_cc,jj_cc,kk,0) + alpha * bdatylo_ph_np1(ii_cc,jj_cc,kk,0);
+                    return (ph_t / xmu_f + phb_arr(ii_cc,jj_cc,kk,0)) / CONST_GRAV;
+                };
+                if (ksrc_max > 0) {
+                    Real z0 = Real(0.5) * (z_target(0) + z_target(1));
+                    Real q0 = oma * bdatylo_n(ii,jj,0) + alpha * bdatylo_np1(ii,jj,0);
+                    if (z_state <= z0) {
+                        qv_t = q0;
+                    } else {
+                        bool found = false;
+                        for (int kk = 0; kk < ksrc_max; ++kk) {
+                            Real zl = Real(0.5) * (z_target(kk) + z_target(kk+1));
+                            Real zh = Real(0.5) * (z_target(kk+1) + z_target(kk+2));
+                            if (z_state <= zh || kk == ksrc_max-1) {
+                                Real ql = oma * bdatylo_n(ii,jj,kk) + alpha * bdatylo_np1(ii,jj,kk);
+                                Real qh = oma * bdatylo_n(ii,jj,kk+1) + alpha * bdatylo_np1(ii,jj,kk+1);
+                                Real dz = amrex::max(zh-zl, Real(1.e-12));
+                                Real lam = (z_state - zl) / dz;
+                                lam = amrex::max(Real(0.0), amrex::min(Real(1.0), lam));
+                                qv_t = (Real(1.0)-lam)*ql + lam*qh;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) { qv_t = oma * bdatylo_n(ii,jj,ksrc_max) + alpha * bdatylo_np1(ii,jj,ksrc_max); }
+                    }
+                }
+            }
         }
+        arr_ylo(i,j,k) = rho * qv_t;
         v_ylo(i,j,k) = ( oma * bdatylo_n_v(ii,jj,k) + alpha * bdatylo_np1_v(ii,jj,k) );
     },
     [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept
@@ -280,14 +448,51 @@ moist_set_rhs (const Geometry& geom,
         int jj = std::min(std::max(j , dom_hi.y-offset), dom_hi.y);
             jj = std::min(jj, dom_hi.y);
         Real rho = new_cons(i,j,k,Rho_comp);
-        Real qv_t = (bdatyhi) ? bdatyhi(ii,jj,k,bdy_comp)
-                              : ( oma * bdatyhi_n(ii,jj,k) + alpha * bdatyhi_np1(ii,jj,k) );
-        if (use_primitive_delta) {
-            Real qv_c = new_cons(i,j,k,RhoQ1_comp) / amrex::max(rho, Real(1.e-16));
-            arr_yhi(i,j,k) = new_cons(i,j,k,RhoQ1_comp) + rho * (qv_t - qv_c);
+        Real qv_t;
+        if (bdatyhi) {
+            qv_t = bdatyhi(ii,jj,k,bdy_comp);
         } else {
-            arr_yhi(i,j,k) = rho * qv_t;
+            Real qv_base = oma * bdatyhi_n(ii,jj,k) + alpha * bdatyhi_np1(ii,jj,k);
+            qv_t = qv_base;
+            if (use_qv_vertical_remap) {
+                // qv remap at cell centers. Modes 1/2 currently share the same operator.
+                const int ksrc_max = amrex::min(kmax_qv_yhi, kmax_ph_yhi-1);
+                const int ii_cc = amrex::min(amrex::max(ii, dom_lo.x), dom_hi.x);
+                const int jj_cc = amrex::min(amrex::max(jj, dom_lo.y), dom_hi.y);
+                const Real z_state = zcc_arr(i,j,k,0);
+                auto z_target = [&](int kk) AMREX_GPU_DEVICE noexcept -> Real {
+                    Real mu_t = oma * bdatyhi_mu_n(ii_cc,jj_cc,0,0) + alpha * bdatyhi_mu_np1(ii_cc,jj_cc,0,0) + mub_arr(ii_cc,jj_cc,0);
+                    Real xmu_f = c1f_arr(0,0,kk,0) * mu_t + c2f_arr(0,0,kk,0);
+                    Real ph_t = oma * bdatyhi_ph_n(ii_cc,jj_cc,kk,0) + alpha * bdatyhi_ph_np1(ii_cc,jj_cc,kk,0);
+                    return (ph_t / xmu_f + phb_arr(ii_cc,jj_cc,kk,0)) / CONST_GRAV;
+                };
+                if (ksrc_max > 0) {
+                    Real z0 = Real(0.5) * (z_target(0) + z_target(1));
+                    Real q0 = oma * bdatyhi_n(ii,jj,0) + alpha * bdatyhi_np1(ii,jj,0);
+                    if (z_state <= z0) {
+                        qv_t = q0;
+                    } else {
+                        bool found = false;
+                        for (int kk = 0; kk < ksrc_max; ++kk) {
+                            Real zl = Real(0.5) * (z_target(kk) + z_target(kk+1));
+                            Real zh = Real(0.5) * (z_target(kk+1) + z_target(kk+2));
+                            if (z_state <= zh || kk == ksrc_max-1) {
+                                Real ql = oma * bdatyhi_n(ii,jj,kk) + alpha * bdatyhi_np1(ii,jj,kk);
+                                Real qh = oma * bdatyhi_n(ii,jj,kk+1) + alpha * bdatyhi_np1(ii,jj,kk+1);
+                                Real dz = amrex::max(zh-zl, Real(1.e-12));
+                                Real lam = (z_state - zl) / dz;
+                                lam = amrex::max(Real(0.0), amrex::min(Real(1.0), lam));
+                                qv_t = (Real(1.0)-lam)*ql + lam*qh;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) { qv_t = oma * bdatyhi_n(ii,jj,ksrc_max) + alpha * bdatyhi_np1(ii,jj,ksrc_max); }
+                    }
+                }
+            }
         }
+        arr_yhi(i,j,k) = rho * qv_t;
         // NOTE: correct for idx type mismatch with v bdy data
         v_yhi(i,j+1,k) = ( oma * bdatyhi_n_v(ii,jj+1,k) + alpha * bdatyhi_np1_v(ii,jj+1,k) );
     });
@@ -425,11 +630,9 @@ moist_set_rhs (const Geometry& geom,
                                tbx_xlo , tbx_xhi , tbx_ylo , tbx_yhi ,
                                arr_xlo , arr_xhi , arr_ylo , arr_yhi ,
                                u_xlo, u_xhi, v_xlo, v_xhi, v_ylo, v_yhi,
-                               new_cons,
                                new_cons, cell_rhs, nudge_scale, dbg_nudge_x, dbg_nudge_y,
                                dbg_nudge_exclude_x_corners, dbg_nudge_const_factor, do_upwind,
                                y_face_owns_corners, dbg_realbdy_yface_corner_use_max_metric,
-                               dbg_realbdy_use_primitive_delta,
                                dbg_realbdy_weight_profile_id, dbg_realbdy_weight_tanh_beta);
 
     /*

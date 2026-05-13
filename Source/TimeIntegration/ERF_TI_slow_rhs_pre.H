@@ -338,6 +338,10 @@
                                                    S_rhs, S_data,
                                                    bdy_data_xlo, bdy_data_xhi,
                                                    bdy_data_ylo, bdy_data_yhi,
+                                                   *mf_MUB, *mf_C1H, *mf_C2H, *mf_C1F, *mf_C2F,
+                                                   *mf_DNW, *mf_PH_wrfin, *mf_PHB_wrfin, *mf_HGT_wrfin,
+                                                   *zpn_to_use,
+                                                   *zpc_to_use,
                                                    m_r2d);
             }
         }

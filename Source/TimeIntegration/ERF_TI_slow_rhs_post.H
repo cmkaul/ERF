@@ -54,6 +54,7 @@
                           xvel_new, yvel_new, zvel_new, cc_src, SmnSmn, eddyDiffs,
                           Hfx1, Hfx2, Hfx3, Q1fx1, Q1fx2, Q1fx3, Q2fx3, Diss,
                           fine_geom, solverChoice, m_SurfaceLayer, domain_bcs_type_d, domain_bcs_type,
+                          *mf_MUB, *mf_C1F, *mf_C2F, *mf_PHB_wrfin,
                           z_phys_nd[level], z_phys_cc[level], ax[level], ay[level], az[level],
                           detJ_cc[level], new_detJ, stretched_dz_d[level], mapfac[level], EBFactory(level),
 #if defined(ERF_USE_NETCDF)

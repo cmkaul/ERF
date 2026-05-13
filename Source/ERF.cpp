@@ -2207,7 +2207,7 @@ ERF::init_only (int lev, Real elapsed_time)
         // The base state is initialized from WRF wrfinput data, output by
         // ideal.exe or real.exe
 
-        init_from_wrfinput(lev, *mf_C1H, *mf_C2H, *mf_MUB, *mf_PSFC[lev]);
+        init_from_wrfinput(lev, *mf_C1H, *mf_C2H, *mf_C1F, *mf_C2F, *mf_DNW, *mf_MUB, *mf_PSFC[lev]);
 
         // The physbc's need the terrain but are needed for initHSE
         if (!solverChoice.use_real_bcs) {

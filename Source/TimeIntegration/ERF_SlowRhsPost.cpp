@@ -71,6 +71,10 @@ void erf_slow_rhs_post (int level, int finest_level,
                         std::unique_ptr<SurfaceLayer>& SurfLayer,
                         const Gpu::DeviceVector<BCRec>& domain_bcs_type_d,
                         const Vector<BCRec>& domain_bcs_type_h,
+                        const MultiFab& mf_MUB,
+                        const MultiFab& mf_C1F,
+                        const MultiFab& mf_C2F,
+                        const MultiFab& mf_PHB_wrfin,
                         std::unique_ptr<MultiFab>& z_phys_nd,
                         std::unique_ptr<MultiFab>& z_phys_cc,
                         std::unique_ptr<MultiFab>& ax,
@@ -260,6 +264,10 @@ void erf_slow_rhs_post (int level, int finest_level,
 
         const Array4<const Real>& z_nd         = z_phys_nd->const_array(mfi);
         const Array4<const Real>& z_cc         = z_phys_cc->const_array(mfi);
+        const Array4<const Real>& mub_arr      = mf_MUB.const_array(mfi);
+        const Array4<const Real>& c1f_arr      = mf_C1F.const_array(mfi);
+        const Array4<const Real>& c2f_arr      = mf_C2F.const_array(mfi);
+        const Array4<const Real>& phb_arr      = mf_PHB_wrfin.const_array(mfi);
         const Array4<const Real>& detJ_new_arr = l_moving_terrain ? detJ_new->const_array(mfi)    : Array4<const Real>{};
 
         // Map factors
@@ -486,6 +494,7 @@ void erf_slow_rhs_post (int level, int finest_level,
             //           start_bdy_time and final_bdy_time are total time
             //
             moist_set_rhs(geom, tbx, new_cons_const, cell_rhs,
+                          mub_arr, c1f_arr, c2f_arr, phb_arr, z_cc,
                           old_stage_time_total, dt, start_bdy_time, final_bdy_time, bdy_time_interval,
                           bdy_factor, width, do_upwind, domain,
                           bdy_data_xlo, bdy_data_xhi, bdy_data_ylo, bdy_data_yhi,

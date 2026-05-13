@@ -1,8 +1,55 @@
 #include <ERF_Utils.H>
+#include <AMReX_PlotFileUtil.H>
+#include <array>
 
 using namespace amrex;
 
 PhysBCFunctNoOp void_bc;
+
+AMREX_GPU_HOST_DEVICE
+AMREX_FORCE_INLINE
+Real
+realbdy_zcc_to_loc (const Array4<Real const>& zcc,
+                    const Dim3& dom_lo, const Dim3& dom_hi,
+                    int i, int j, int k,
+                    int loc, int loc_u, int loc_v) noexcept
+{
+    amrex::ignore_unused(dom_lo, dom_hi);
+    if (loc == loc_u) {
+        return myhalf * (zcc(i-1,j,k,0) + zcc(i,j,k,0));
+    } else if (loc == loc_v) {
+        return myhalf * (zcc(i,j-1,k,0) + zcc(i,j,k,0));
+    } else {
+        return zcc(i,j,k,0);
+    }
+}
+
+AMREX_GPU_HOST_DEVICE
+AMREX_FORCE_INLINE
+Real
+realbdy_z0nd_to_loc (const Array4<Real const>& znd,
+                     const Dim3& dom_lo, const Dim3& dom_hi,
+                     int i, int j,
+                     int loc, int loc_u, int loc_v) noexcept
+{
+    const int in0 = amrex::min(amrex::max(i,   dom_lo.x), dom_hi.x);
+    const int in1 = amrex::min(amrex::max(i+1, dom_lo.x), dom_hi.x);
+    const int jn0 = amrex::min(amrex::max(j,   dom_lo.y), dom_hi.y);
+    const int jn1 = amrex::min(amrex::max(j+1, dom_lo.y), dom_hi.y);
+    constexpr int k0 = 0;
+
+    if (loc == loc_u) {
+        // u is x-face-centered, y-cell-centered
+        return myhalf * (znd(in0,jn0,k0,0) + znd(in0,jn1,k0,0));
+    } else if (loc == loc_v) {
+        // v is y-face-centered, x-cell-centered
+        return myhalf * (znd(in0,jn0,k0,0) + znd(in1,jn0,k0,0));
+    } else {
+        // theta/cc is cell-centered in x and y
+        return fourth * (znd(in0,jn0,k0,0) + znd(in1,jn0,k0,0) +
+                         znd(in0,jn1,k0,0) + znd(in1,jn1,k0,0));
+    }
+}
 
 /**
  * Get the boxes for looping over interior/exterior ghost cells
@@ -115,6 +162,17 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
                                     Vector<Vector<FArrayBox>>& bdy_data_xhi,
                                     Vector<Vector<FArrayBox>>& bdy_data_ylo,
                                     Vector<Vector<FArrayBox>>& bdy_data_yhi,
+                                    const MultiFab& mf_MUB,
+                                    const MultiFab& mf_C1H,
+                                    const MultiFab& mf_C2H,
+                                    const MultiFab& mf_C1F,
+                                    const MultiFab& mf_C2F,
+                                    const MultiFab& mf_DNW,
+                                    const MultiFab& mf_PH_wrfin,
+                                    const MultiFab& mf_PHB_wrfin,
+                                    const MultiFab& mf_HGT_wrfin,
+                                    const MultiFab& z_phys_nd,
+                                    const MultiFab& z_phys_cc,
                                     std::unique_ptr<ReadBndryPlanes>& m_r2d)
 {
     BL_PROFILE_REGION("realbdy_compute_interior_ghost_RHS()");
@@ -133,7 +191,21 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
     static bool dbg_realbdy_yface_corner_owner = false;
     static bool dbg_realbdy_component_corner_owner = false;
     static bool dbg_realbdy_yface_corner_use_max_metric = true;
-    static bool dbg_realbdy_use_primitive_delta = false;
+    static bool dbg_realbdy_rho_pathB_diag = false;
+    static bool dbg_realbdy_use_wrf_rho_interp = false;
+    static bool realbdy_vertical_remap_theta = false;
+    static int realbdy_vertical_remap_mode = 1; // 1=A-2 (default), 2=B, 3=C, 4=D
+    static bool dbg_realbdy_zdrift_diag = false;
+    static bool dbg_realbdy_zstats_diag = false;
+    static bool dbg_realbdy_zalign_diag = false;
+    static int dbg_realbdy_zalign_every_nrhs = 1;
+    static int dbg_realbdy_zalign_counter = 0;
+    static bool dbg_realbdy_dump_theta_fields = false;
+    static int dbg_realbdy_dump_theta_every_nrhs = 1;
+    static int dbg_realbdy_dump_theta_counter = 0;
+    static std::string dbg_realbdy_dump_theta_prefix = "realbdy_theta_dbg";
+    static int dbg_realbdy_zdrift_every_nrhs = 20;
+    static int dbg_realbdy_zdrift_counter = 0;
     static std::string dbg_realbdy_weight_profile = "quadratic";
     static int dbg_realbdy_weight_profile_id = 0; // 0=quadratic,1=cosine,2=tanh
     static Real dbg_realbdy_weight_tanh_beta = Real(2.5);
@@ -155,7 +227,18 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
         pp.query("dbg_realbdy_yface_corner_owner", dbg_realbdy_yface_corner_owner);
         pp.query("dbg_realbdy_component_corner_owner", dbg_realbdy_component_corner_owner);
         pp.query("dbg_realbdy_yface_corner_use_max_metric", dbg_realbdy_yface_corner_use_max_metric);
-        pp.query("dbg_realbdy_use_primitive_delta", dbg_realbdy_use_primitive_delta);
+        pp.query("dbg_realbdy_rho_pathB_diag", dbg_realbdy_rho_pathB_diag);
+        pp.query("dbg_realbdy_use_wrf_rho_interp", dbg_realbdy_use_wrf_rho_interp);
+        pp.query("realbdy_vertical_remap_theta", realbdy_vertical_remap_theta);
+        pp.query("realbdy_vertical_remap_mode", realbdy_vertical_remap_mode);
+        pp.query("dbg_realbdy_zdrift_diag", dbg_realbdy_zdrift_diag);
+        pp.query("dbg_realbdy_zstats_diag", dbg_realbdy_zstats_diag);
+        pp.query("dbg_realbdy_zalign_diag", dbg_realbdy_zalign_diag);
+        pp.query("dbg_realbdy_zalign_every_nrhs", dbg_realbdy_zalign_every_nrhs);
+        pp.query("dbg_realbdy_dump_theta_fields", dbg_realbdy_dump_theta_fields);
+        pp.query("dbg_realbdy_dump_theta_every_nrhs", dbg_realbdy_dump_theta_every_nrhs);
+        pp.query("dbg_realbdy_dump_theta_prefix", dbg_realbdy_dump_theta_prefix);
+        pp.query("dbg_realbdy_zdrift_every_nrhs", dbg_realbdy_zdrift_every_nrhs);
         pp.query("dbg_realbdy_weight_profile", dbg_realbdy_weight_profile);
         pp.query("dbg_realbdy_weight_tanh_beta", dbg_realbdy_weight_tanh_beta);
         pp.query("dbg_nudge_const_factor", dbg_nudge_const_factor);
@@ -176,6 +259,17 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
             }
             dbg_realbdy_weight_profile_id = 0;
             dbg_realbdy_weight_profile = "quadratic";
+        }
+        if (realbdy_vertical_remap_mode != 1 &&
+            realbdy_vertical_remap_mode != 2 &&
+            realbdy_vertical_remap_mode != 3 &&
+            realbdy_vertical_remap_mode != 4) {
+            if (ParallelDescriptor::IOProcessor()) {
+                Print() << "WARNING: Unknown erf.realbdy_vertical_remap_mode="
+                        << realbdy_vertical_remap_mode
+                        << ". Falling back to mode=1 (A-2).\n";
+            }
+            realbdy_vertical_remap_mode = 1;
         }
         dbg_flags_init = true;
     }
@@ -201,6 +295,7 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
         }
         dbg_corner_owner_print_once = true;
     }
+    static bool dbg_realbdy_boxes_print_once = false;
 
     // HACK HACK HACK
     // Get bndry data
@@ -242,6 +337,677 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
         oma = one;
         alpha = zero;
     }
+    const bool have_wrfbdy_ph = (bdy_data_xlo[n_time].size() > WRFBdyVars::PH &&
+                                 bdy_data_xlo[n_time_p1].size() > WRFBdyVars::PH);
+    static bool dbg_rho_size_once = false;
+    if (dbg_realbdy_rho_pathB_diag && !dbg_rho_size_once && ParallelDescriptor::IOProcessor()) {
+        dbg_rho_size_once = true;
+        Print() << "[DBG_RHO_PATHB sizes] n_time=" << n_time
+                << " n_time_p1=" << n_time_p1
+                << " size(n)=" << bdy_data_xlo[n_time].size()
+                << " size(np1)=" << bdy_data_xlo[n_time_p1].size()
+                << " WRFBdyVars::PH=" << WRFBdyVars::PH
+                << std::endl;
+    }
+    const bool use_wrf_rho_interp = dbg_realbdy_use_wrf_rho_interp && have_wrfbdy_ph;
+    const bool use_theta_vertical_remap = realbdy_vertical_remap_theta && have_wrfbdy_ph;
+    if (dbg_realbdy_use_wrf_rho_interp && !have_wrfbdy_ph && ParallelDescriptor::IOProcessor()) {
+        Print() << "[DBG_RHO_PATHB] PH boundary field unavailable; using ERF rho interpolation instead.\n";
+    }
+    if (realbdy_vertical_remap_theta && !have_wrfbdy_ph && ParallelDescriptor::IOProcessor()) {
+        Print() << "[REALBDY theta-remap] PH boundary field unavailable; disabling theta vertical remap.\n";
+    }
+    ++dbg_realbdy_dump_theta_counter;
+    const bool do_dump_theta_this_rhs = dbg_realbdy_dump_theta_fields &&
+        (dbg_realbdy_dump_theta_every_nrhs <= 1 ||
+         (dbg_realbdy_dump_theta_counter % dbg_realbdy_dump_theta_every_nrhs == 0));
+
+#ifndef AMREX_USE_GPU
+    ++dbg_realbdy_zalign_counter;
+    const bool do_zalign_this_rhs = dbg_realbdy_zalign_diag && have_wrfbdy_ph &&
+        (dbg_realbdy_zalign_every_nrhs <= 1 ||
+         (dbg_realbdy_zalign_counter % dbg_realbdy_zalign_every_nrhs == 0));
+
+    if (do_zalign_this_rhs) {
+        struct ZStats2 {
+            Long n = 0;
+            Real minv = std::numeric_limits<Real>::max();
+            Real maxv = -std::numeric_limits<Real>::max();
+            Real sum = 0.0_rt;
+            Real sumabs = 0.0_rt;
+            Real sumsq = 0.0_rt;
+            AMREX_FORCE_INLINE void add(Real v) noexcept {
+                if (!std::isfinite(static_cast<double>(v))) return;
+                ++n;
+                minv = std::min(minv, v);
+                maxv = std::max(maxv, v);
+                sum += v;
+                sumabs += std::abs(v);
+                sumsq += v*v;
+            }
+        };
+        auto reduce_stats2 = [] (ZStats2& s) {
+            ParallelDescriptor::ReduceLongSum(s.n);
+            ParallelDescriptor::ReduceRealMin(s.minv);
+            ParallelDescriptor::ReduceRealMax(s.maxv);
+            ParallelDescriptor::ReduceRealSum(s.sum);
+            ParallelDescriptor::ReduceRealSum(s.sumabs);
+            ParallelDescriptor::ReduceRealSum(s.sumsq);
+        };
+
+        enum {LOC_T=0, LOC_U=1, LOC_V=2};
+        enum {FXLO=0, FXHI=1, FYLO=2, FYHI=3};
+        constexpr int NLOC = 3, NFACE = 4, NK = 7;
+        const std::array<int,NK> k_levels = {0,5,10,20,40,80,119};
+        ZStats2 stats_minus[NLOC][NFACE][NK];
+        ZStats2 stats_minus_edgeinc[NLOC][NFACE][NK];
+
+        const auto& ph_xlo_n   = bdy_data_xlo[n_time][WRFBdyVars::PH].const_array();
+        const auto& ph_xlo_np1 = bdy_data_xlo[n_time_p1][WRFBdyVars::PH].const_array();
+        const auto& ph_xhi_n   = bdy_data_xhi[n_time][WRFBdyVars::PH].const_array();
+        const auto& ph_xhi_np1 = bdy_data_xhi[n_time_p1][WRFBdyVars::PH].const_array();
+        const auto& ph_ylo_n   = bdy_data_ylo[n_time][WRFBdyVars::PH].const_array();
+        const auto& ph_ylo_np1 = bdy_data_ylo[n_time_p1][WRFBdyVars::PH].const_array();
+        const auto& ph_yhi_n   = bdy_data_yhi[n_time][WRFBdyVars::PH].const_array();
+        const auto& ph_yhi_np1 = bdy_data_yhi[n_time_p1][WRFBdyVars::PH].const_array();
+        const auto& mu_xlo_n   = bdy_data_xlo[n_time][WRFBdyVars::MU].const_array();
+        const auto& mu_xlo_np1 = bdy_data_xlo[n_time_p1][WRFBdyVars::MU].const_array();
+        const auto& mu_xhi_n   = bdy_data_xhi[n_time][WRFBdyVars::MU].const_array();
+        const auto& mu_xhi_np1 = bdy_data_xhi[n_time_p1][WRFBdyVars::MU].const_array();
+        const auto& mu_ylo_n   = bdy_data_ylo[n_time][WRFBdyVars::MU].const_array();
+        const auto& mu_ylo_np1 = bdy_data_ylo[n_time_p1][WRFBdyVars::MU].const_array();
+        const auto& mu_yhi_n   = bdy_data_yhi[n_time][WRFBdyVars::MU].const_array();
+        const auto& mu_yhi_np1 = bdy_data_yhi[n_time_p1][WRFBdyVars::MU].const_array();
+
+        const Box dom = geom.Domain();
+        const int ilo = dom.smallEnd(0), ihi = dom.bigEnd(0);
+        const int jlo = dom.smallEnd(1), jhi = dom.bigEnd(1);
+        const int nd_xlo = ilo, nd_xhi = ihi + 1;
+        const int nd_ylo = jlo, nd_yhi = jhi + 1;
+        const int nd_zlo = dom.smallEnd(2), nd_zhi = dom.bigEnd(2) + 1;
+
+        for (MFIter mfi(z_phys_nd); mfi.isValid(); ++mfi) {
+            const auto znd = z_phys_nd.const_array(mfi);
+            const auto zcc = z_phys_cc.const_array(mfi);
+            const auto hgt = mf_HGT_wrfin.const_array(mfi);
+            const auto phb = mf_PHB_wrfin.const_array(mfi);
+            const auto mub = mf_MUB.const_array(mfi);
+            const auto c1f = mf_C1F.const_array(mfi);
+            const auto c2f = mf_C2F.const_array(mfi);
+            const int kmax_cf = mf_C1F[mfi].box().bigEnd(2);
+            const Box bx = mfi.validbox() & amrex::surroundingNodes(dom);
+            if (!bx.ok()) continue;
+
+            const Dim3 dom_cc_lo = lbound(dom);
+            const Dim3 dom_cc_hi = ubound(dom);
+            const Box dom_nd_box = amrex::surroundingNodes(dom);
+            const Dim3 dom_nd_lo = lbound(dom_nd_box);
+            const Dim3 dom_nd_hi = ubound(dom_nd_box);
+
+            auto ztgt = [=] (int loc, int i, int j, int k) -> Real {
+                return realbdy_zcc_to_loc(zcc, dom_cc_lo, dom_cc_hi, i, j, k, loc, LOC_U, LOC_V);
+            };
+            auto hgt_loc = [=] (int loc, int i, int j) -> Real {
+                return realbdy_zcc_to_loc(hgt, dom_cc_lo, dom_cc_hi, i, j, 0, loc, LOC_U, LOC_V);
+            };
+            auto z0_erf_loc = [=] (int loc, int i, int j) -> Real {
+                return realbdy_z0nd_to_loc(znd, dom_nd_lo, dom_nd_hi, i, j, loc, LOC_U, LOC_V);
+            };
+            auto d_agl = [=] (int loc, int i, int j, int k, Real zsrc) -> Real {
+                const Real z_wrf_agl = zsrc - hgt_loc(loc, i, j);
+                const Real z_erf_agl = ztgt(loc, i, j, k) - z0_erf_loc(loc, i, j);
+                return z_wrf_agl - z_erf_agl;
+            };
+
+            auto zw_face = [=] (int face, int i, int j, int k) -> Real {
+                const int kc = amrex::max(0, amrex::min(k, kmax_cf));
+                if (face == FXLO) {
+                    Real mu_t = oma * mu_xlo_n(i,j,0,0) + alpha * mu_xlo_np1(i,j,0,0) + mub(i,j,0,0);
+                    Real xmu_f = c1f(0,0,kc,0) * mu_t + c2f(0,0,kc,0);
+                    Real ph_t = oma * ph_xlo_n(i,j,k,0) + alpha * ph_xlo_np1(i,j,k,0);
+                    return (ph_t / xmu_f + phb(i,j,k,0)) / CONST_GRAV;
+                } else if (face == FXHI) {
+                    Real mu_t = oma * mu_xhi_n(i,j,0,0) + alpha * mu_xhi_np1(i,j,0,0) + mub(i,j,0,0);
+                    Real xmu_f = c1f(0,0,kc,0) * mu_t + c2f(0,0,kc,0);
+                    Real ph_t = oma * ph_xhi_n(i,j,k,0) + alpha * ph_xhi_np1(i,j,k,0);
+                    return (ph_t / xmu_f + phb(i,j,k,0)) / CONST_GRAV;
+                } else if (face == FYLO) {
+                    Real mu_t = oma * mu_ylo_n(i,j,0,0) + alpha * mu_ylo_np1(i,j,0,0) + mub(i,j,0,0);
+                    Real xmu_f = c1f(0,0,kc,0) * mu_t + c2f(0,0,kc,0);
+                    Real ph_t = oma * ph_ylo_n(i,j,k,0) + alpha * ph_ylo_np1(i,j,k,0);
+                    return (ph_t / xmu_f + phb(i,j,k,0)) / CONST_GRAV;
+                } else {
+                    Real mu_t = oma * mu_yhi_n(i,j,0,0) + alpha * mu_yhi_np1(i,j,0,0) + mub(i,j,0,0);
+                    Real xmu_f = c1f(0,0,kc,0) * mu_t + c2f(0,0,kc,0);
+                    Real ph_t = oma * ph_yhi_n(i,j,k,0) + alpha * ph_yhi_np1(i,j,k,0);
+                    return (ph_t / xmu_f + phb(i,j,k,0)) / CONST_GRAV;
+                }
+            };
+
+            for (int b = 0; b < width; ++b) {
+                int ixlo = ilo + b;
+                int ixhi = ihi - b;
+                for (int j = std::max(jlo, bx.smallEnd(1)); j <= std::min(jhi, bx.bigEnd(1)); ++j) {
+                    for (int ik = 0; ik < NK; ++ik) {
+                        int k = k_levels[ik];
+                        if (k < std::max(0, bx.smallEnd(2)) || k+1 > std::min(dom.bigEnd(2)+1, bx.bigEnd(2))) continue;
+                        if (ixlo >= bx.smallEnd(0) && ixlo <= bx.bigEnd(0)) {
+                            const bool has_i_minus = (ixlo-1 >= ilo);
+                            const bool has_j_minus = (j-1 >= jlo);
+                            int il_m = amrex::max(ilo, amrex::min(ixlo-1, ihi));
+                            int ir_m = amrex::max(ilo, amrex::min(ixlo,   ihi));
+                            int jb_m = amrex::max(jlo, amrex::min(j, jhi));
+                            int jl_m = amrex::max(jlo, amrex::min(j-1, jhi));
+                            int ju_m = amrex::max(jlo, amrex::min(j,   jhi));
+                            Real zsrc_t_m = Real(0.5) * (zw_face(FXLO,ir_m,jb_m,k) + zw_face(FXLO,ir_m,jb_m,k+1));
+                            Real zsrc_u_m = Real(0.25) * (zw_face(FXLO,il_m,jb_m,k) + zw_face(FXLO,il_m,jb_m,k+1) +
+                                                          zw_face(FXLO,ir_m,jb_m,k) + zw_face(FXLO,ir_m,jb_m,k+1));
+                            Real zsrc_v_m = Real(0.25) * (zw_face(FXLO,ir_m,jl_m,k) + zw_face(FXLO,ir_m,jl_m,k+1) +
+                                                          zw_face(FXLO,ir_m,ju_m,k) + zw_face(FXLO,ir_m,ju_m,k+1));
+                            Real d_t = d_agl(LOC_T, ixlo, j, k, zsrc_t_m);
+                            Real d_u = d_agl(LOC_U, ixlo, j, k, zsrc_u_m);
+                            Real d_v = d_agl(LOC_V, ixlo, j, k, zsrc_v_m);
+                            stats_minus[LOC_T][FXLO][ik].add(d_t);
+                            stats_minus_edgeinc[LOC_T][FXLO][ik].add(d_t);
+                            if (has_i_minus) stats_minus[LOC_U][FXLO][ik].add(d_agl(LOC_U, ixlo, j, k, zsrc_u_m));
+                            if (has_j_minus) stats_minus[LOC_V][FXLO][ik].add(d_agl(LOC_V, ixlo, j, k, zsrc_v_m));
+                            stats_minus_edgeinc[LOC_U][FXLO][ik].add(d_u);
+                            stats_minus_edgeinc[LOC_V][FXLO][ik].add(d_v);
+
+                        }
+                        if (ixhi >= bx.smallEnd(0) && ixhi <= bx.bigEnd(0)) {
+                            const bool has_i_minus = (ixhi-1 >= ilo);
+                            const bool has_j_minus = (j-1 >= jlo);
+                            int il_m = amrex::max(ilo, amrex::min(ixhi-1, ihi));
+                            int ir_m = amrex::max(ilo, amrex::min(ixhi,   ihi));
+                            int jb_m = amrex::max(jlo, amrex::min(j, jhi));
+                            int jl_m = amrex::max(jlo, amrex::min(j-1, jhi));
+                            int ju_m = amrex::max(jlo, amrex::min(j,   jhi));
+                            Real zsrc_t_m = Real(0.5) * (zw_face(FXHI,ir_m,jb_m,k) + zw_face(FXHI,ir_m,jb_m,k+1));
+                            Real zsrc_u_m = Real(0.25) * (zw_face(FXHI,il_m,jb_m,k) + zw_face(FXHI,il_m,jb_m,k+1) +
+                                                          zw_face(FXHI,ir_m,jb_m,k) + zw_face(FXHI,ir_m,jb_m,k+1));
+                            Real zsrc_v_m = Real(0.25) * (zw_face(FXHI,ir_m,jl_m,k) + zw_face(FXHI,ir_m,jl_m,k+1) +
+                                                          zw_face(FXHI,ir_m,ju_m,k) + zw_face(FXHI,ir_m,ju_m,k+1));
+                            Real d_t = d_agl(LOC_T, ixhi, j, k, zsrc_t_m);
+                            Real d_u = d_agl(LOC_U, ixhi, j, k, zsrc_u_m);
+                            Real d_v = d_agl(LOC_V, ixhi, j, k, zsrc_v_m);
+                            stats_minus[LOC_T][FXHI][ik].add(d_t);
+                            stats_minus_edgeinc[LOC_T][FXHI][ik].add(d_t);
+                            if (has_i_minus) stats_minus[LOC_U][FXHI][ik].add(d_agl(LOC_U, ixhi, j, k, zsrc_u_m));
+                            if (has_j_minus) stats_minus[LOC_V][FXHI][ik].add(d_agl(LOC_V, ixhi, j, k, zsrc_v_m));
+                            stats_minus_edgeinc[LOC_U][FXHI][ik].add(d_u);
+                            stats_minus_edgeinc[LOC_V][FXHI][ik].add(d_v);
+
+                        }
+                    }
+                }
+            }
+
+            for (int b = 0; b < width; ++b) {
+                int jylo = jlo + b;
+                int jyhi = jhi - b;
+                for (int i = std::max(ilo, bx.smallEnd(0)); i <= std::min(ihi, bx.bigEnd(0)); ++i) {
+                    for (int ik = 0; ik < NK; ++ik) {
+                        int k = k_levels[ik];
+                        if (k < std::max(0, bx.smallEnd(2)) || k+1 > std::min(dom.bigEnd(2)+1, bx.bigEnd(2))) continue;
+                        if (jylo >= bx.smallEnd(1) && jylo <= bx.bigEnd(1)) {
+                            const bool has_i_minus = (i-1 >= ilo);
+                            const bool has_j_minus = (jylo-1 >= jlo);
+                            int jl_m = amrex::max(jlo, amrex::min(jylo-1, jhi));
+                            int ju_m = amrex::max(jlo, amrex::min(jylo,   jhi));
+                            int ib_m = amrex::max(ilo, amrex::min(i, ihi));
+                            int il_m = amrex::max(ilo, amrex::min(i-1, ihi));
+                            int ir_m = amrex::max(ilo, amrex::min(i,   ihi));
+                            Real zsrc_t_m = Real(0.5) * (zw_face(FYLO,ib_m,ju_m,k) + zw_face(FYLO,ib_m,ju_m,k+1));
+                            Real zsrc_u_m = Real(0.25) * (zw_face(FYLO,il_m,ju_m,k) + zw_face(FYLO,il_m,ju_m,k+1) +
+                                                          zw_face(FYLO,ir_m,ju_m,k) + zw_face(FYLO,ir_m,ju_m,k+1));
+                            Real zsrc_v_m = Real(0.25) * (zw_face(FYLO,ib_m,jl_m,k) + zw_face(FYLO,ib_m,jl_m,k+1) +
+                                                          zw_face(FYLO,ib_m,ju_m,k) + zw_face(FYLO,ib_m,ju_m,k+1));
+                            Real d_t = d_agl(LOC_T, i, jylo, k, zsrc_t_m);
+                            Real d_u = d_agl(LOC_U, i, jylo, k, zsrc_u_m);
+                            Real d_v = d_agl(LOC_V, i, jylo, k, zsrc_v_m);
+                            stats_minus[LOC_T][FYLO][ik].add(d_t);
+                            stats_minus_edgeinc[LOC_T][FYLO][ik].add(d_t);
+                            if (has_i_minus) stats_minus[LOC_U][FYLO][ik].add(d_agl(LOC_U, i, jylo, k, zsrc_u_m));
+                            if (has_j_minus) stats_minus[LOC_V][FYLO][ik].add(d_agl(LOC_V, i, jylo, k, zsrc_v_m));
+                            stats_minus_edgeinc[LOC_U][FYLO][ik].add(d_u);
+                            stats_minus_edgeinc[LOC_V][FYLO][ik].add(d_v);
+
+                        }
+                        if (jyhi >= bx.smallEnd(1) && jyhi <= bx.bigEnd(1)) {
+                            const bool has_i_minus = (i-1 >= ilo);
+                            const bool has_j_minus = (jyhi-1 >= jlo);
+                            int jl_m = amrex::max(jlo, amrex::min(jyhi-1, jhi));
+                            int ju_m = amrex::max(jlo, amrex::min(jyhi,   jhi));
+                            int ib_m = amrex::max(ilo, amrex::min(i, ihi));
+                            int il_m = amrex::max(ilo, amrex::min(i-1, ihi));
+                            int ir_m = amrex::max(ilo, amrex::min(i,   ihi));
+                            Real zsrc_t_m = Real(0.5) * (zw_face(FYHI,ib_m,ju_m,k) + zw_face(FYHI,ib_m,ju_m,k+1));
+                            Real zsrc_u_m = Real(0.25) * (zw_face(FYHI,il_m,ju_m,k) + zw_face(FYHI,il_m,ju_m,k+1) +
+                                                          zw_face(FYHI,ir_m,ju_m,k) + zw_face(FYHI,ir_m,ju_m,k+1));
+                            Real zsrc_v_m = Real(0.25) * (zw_face(FYHI,ib_m,jl_m,k) + zw_face(FYHI,ib_m,jl_m,k+1) +
+                                                          zw_face(FYHI,ib_m,ju_m,k) + zw_face(FYHI,ib_m,ju_m,k+1));
+                            Real d_t = d_agl(LOC_T, i, jyhi, k, zsrc_t_m);
+                            Real d_u = d_agl(LOC_U, i, jyhi, k, zsrc_u_m);
+                            Real d_v = d_agl(LOC_V, i, jyhi, k, zsrc_v_m);
+                            stats_minus[LOC_T][FYHI][ik].add(d_t);
+                            stats_minus_edgeinc[LOC_T][FYHI][ik].add(d_t);
+                            if (has_i_minus) stats_minus[LOC_U][FYHI][ik].add(d_agl(LOC_U, i, jyhi, k, zsrc_u_m));
+                            if (has_j_minus) stats_minus[LOC_V][FYHI][ik].add(d_agl(LOC_V, i, jyhi, k, zsrc_v_m));
+                            stats_minus_edgeinc[LOC_U][FYHI][ik].add(d_u);
+                            stats_minus_edgeinc[LOC_V][FYHI][ik].add(d_v);
+
+                        }
+                    }
+                }
+            }
+        }
+
+        const char* loc_name[NLOC] = {"theta_cc","u_face","v_face"};
+        const char* face_name[NFACE] = {"xlo","xhi","ylo","yhi"};
+        for (int il=0; il<NLOC; ++il) for (int jf=0; jf<NFACE; ++jf) for (int ik=0; ik<NK; ++ik) {
+            reduce_stats2(stats_minus[il][jf][ik]);
+            reduce_stats2(stats_minus_edgeinc[il][jf][ik]);
+        }
+
+        auto merge_stats2 = [] (ZStats2& acc, const ZStats2& s) {
+            if (s.n == 0) return;
+            if (acc.n == 0) {
+                acc.minv = s.minv;
+                acc.maxv = s.maxv;
+            } else {
+                acc.minv = std::min(acc.minv, s.minv);
+                acc.maxv = std::max(acc.maxv, s.maxv);
+            }
+            acc.n += s.n;
+            acc.sum += s.sum;
+            acc.sumabs += s.sumabs;
+            acc.sumsq += s.sumsq;
+        };
+
+        auto print_stats2 = [] (const char* tag, const ZStats2& s) {
+            if (s.n == 0) {
+                Print() << "  " << tag << ": n=0\n";
+                return;
+            }
+            Real mean = s.sum / static_cast<Real>(s.n);
+            Real absmean = s.sumabs / static_cast<Real>(s.n);
+            Real rms = std::sqrt(s.sumsq / static_cast<Real>(s.n));
+            Print() << "  " << tag
+                    << ": n=" << s.n
+                    << " min=" << s.minv
+                    << " max=" << s.maxv
+                    << " mean=" << mean
+                    << " absmean=" << absmean
+                    << " rms=" << rms << "\n";
+        };
+
+        ZStats2 stats_face[NLOC][NFACE];
+        ZStats2 stats_strip[NLOC];
+        ZStats2 stats_face_edgeinc[NLOC][NFACE];
+        ZStats2 stats_strip_edgeinc[NLOC];
+        for (int il=0; il<NLOC; ++il) {
+            for (int jf=0; jf<NFACE; ++jf) {
+                for (int ik=0; ik<NK; ++ik) {
+                    merge_stats2(stats_face[il][jf], stats_minus[il][jf][ik]);
+                    merge_stats2(stats_face_edgeinc[il][jf], stats_minus_edgeinc[il][jf][ik]);
+                }
+                merge_stats2(stats_strip[il], stats_face[il][jf]);
+                merge_stats2(stats_strip_edgeinc[il], stats_face_edgeinc[il][jf]);
+            }
+        }
+
+        if (ParallelDescriptor::IOProcessor()) {
+            Print() << "[DBG_ZALIGN] AGL comparison | time=" << time << " alpha=" << alpha
+                    << " n_time=" << n_time << " n_time_p1=" << n_time_p1
+                    << " rhs_count=" << dbg_realbdy_zalign_counter << "\n";
+            for (int il=0; il<NLOC; ++il) {
+                Print() << " loc=" << loc_name[il] << "\n";
+                print_stats2("strip_agl", stats_strip[il]);
+                for (int jf=0; jf<NFACE; ++jf) {
+                    print_stats2(face_name[jf], stats_face[il][jf]);
+                }
+                Print() << " loc=" << loc_name[il] << " (include_strip_edges)\n";
+                print_stats2("strip_agl", stats_strip_edgeinc[il]);
+                for (int jf=0; jf<NFACE; ++jf) {
+                    print_stats2(face_name[jf], stats_face_edgeinc[il][jf]);
+                }
+            }
+        }
+    }
+
+    ++dbg_realbdy_zdrift_counter;
+    if (dbg_realbdy_zdrift_diag && have_wrfbdy_ph && ParallelDescriptor::IOProcessor() &&
+        (dbg_realbdy_zdrift_every_nrhs <= 1 || (dbg_realbdy_zdrift_counter % dbg_realbdy_zdrift_every_nrhs == 0))) {
+        const int klist_raw[3] = {0, 5, 20};
+        const auto& ph_xlo_n   = bdy_data_xlo[n_time][WRFBdyVars::PH].const_array();
+        const auto& ph_xlo_np1 = bdy_data_xlo[n_time_p1][WRFBdyVars::PH].const_array();
+        const auto& ph_xhi_n   = bdy_data_xhi[n_time][WRFBdyVars::PH].const_array();
+        const auto& ph_xhi_np1 = bdy_data_xhi[n_time_p1][WRFBdyVars::PH].const_array();
+        const auto& ph_ylo_n   = bdy_data_ylo[n_time][WRFBdyVars::PH].const_array();
+        const auto& ph_ylo_np1 = bdy_data_ylo[n_time_p1][WRFBdyVars::PH].const_array();
+        const auto& ph_yhi_n   = bdy_data_yhi[n_time][WRFBdyVars::PH].const_array();
+        const auto& ph_yhi_np1 = bdy_data_yhi[n_time_p1][WRFBdyVars::PH].const_array();
+        const auto& mu_xlo_n   = bdy_data_xlo[n_time][WRFBdyVars::MU].const_array();
+        const auto& mu_xlo_np1 = bdy_data_xlo[n_time_p1][WRFBdyVars::MU].const_array();
+        const auto& mu_xhi_n   = bdy_data_xhi[n_time][WRFBdyVars::MU].const_array();
+        const auto& mu_xhi_np1 = bdy_data_xhi[n_time_p1][WRFBdyVars::MU].const_array();
+        const auto& mu_ylo_n   = bdy_data_ylo[n_time][WRFBdyVars::MU].const_array();
+        const auto& mu_ylo_np1 = bdy_data_ylo[n_time_p1][WRFBdyVars::MU].const_array();
+        const auto& mu_yhi_n   = bdy_data_yhi[n_time][WRFBdyVars::MU].const_array();
+        const auto& mu_yhi_np1 = bdy_data_yhi[n_time_p1][WRFBdyVars::MU].const_array();
+
+        bool printed = false;
+        for (MFIter mfi(z_phys_nd); mfi.isValid() && !printed; ++mfi) {
+            const auto znd = z_phys_nd.const_array(mfi);
+            const auto phb = mf_PHB_wrfin.const_array(mfi);
+            const auto mub = mf_MUB.const_array(mfi);
+            const auto c1f = mf_C1F.const_array(mfi);
+            const auto c2f = mf_C2F.const_array(mfi);
+            const Box bx = mfi.validbox();
+            int jmid = (bx.smallEnd(1) + bx.bigEnd(1)) / 2;
+            int imid = (bx.smallEnd(0) + bx.bigEnd(0)) / 2;
+            int ilo = geom.Domain().smallEnd(0);
+            int ihi = geom.Domain().bigEnd(0);
+            int jlo = geom.Domain().smallEnd(1);
+            int jhi = geom.Domain().bigEnd(1);
+            const int ixl = std::min(std::max(ilo, bx.smallEnd(0)), bx.bigEnd(0));
+            const int ixh = std::min(std::max(ihi, bx.smallEnd(0)), bx.bigEnd(0));
+            const int iym = std::min(std::max(imid,   bx.smallEnd(0)), bx.bigEnd(0));
+            const int jyl = std::min(std::max(jlo, bx.smallEnd(1)), bx.bigEnd(1));
+            const int jyh = std::min(std::max(jhi, bx.smallEnd(1)), bx.bigEnd(1));
+            const int jxm = std::min(std::max(jmid,    bx.smallEnd(1)), bx.bigEnd(1));
+
+            Print() << "[DBG_ZDRIFT] time=" << time << " alpha=" << alpha
+                    << " n_time=" << n_time << " n_time_p1=" << n_time_p1 << "\n";
+            for (int kk = 0; kk < 3; ++kk) {
+                int k = std::min(klist_raw[kk], geom.Domain().bigEnd(2)-1);
+                auto wrf_zw_x = [&](auto phn, auto php1, auto mun, auto mup1,
+                                    int ig, int jg, int kz) {
+                    const Real mu_bdy = oma * mun(ig,jg,0,0) + alpha * mup1(ig,jg,0,0);
+                    const Real mu_d = mu_bdy + mub(ig,jg,0,0);
+                    const Real xmu_mult_f = c1f(0,0,kz,0) * mu_d + c2f(0,0,kz,0);
+                    Real phi = (oma * phn(ig,jg,kz,0) + alpha * php1(ig,jg,kz,0)) / xmu_mult_f
+                               + phb(ig,jg,kz,0);
+                    return phi / Real(9.81);
+                };
+                auto wrf_zw_y = [&](auto phn, auto php1, auto mun, auto mup1,
+                                    int ig, int jg, int kz) {
+                    const Real mu_bdy = oma * mun(ig,jg,0,0) + alpha * mup1(ig,jg,0,0);
+                    const Real mu_d = mu_bdy + mub(ig,jg,0,0);
+                    const Real xmu_mult_f = c1f(0,0,kz,0) * mu_d + c2f(0,0,kz,0);
+                    Real phi = (oma * phn(ig,jg,kz,0) + alpha * php1(ig,jg,kz,0)) / xmu_mult_f
+                               + phb(ig,jg,kz,0);
+                    return phi / Real(9.81);
+                };
+                Real zw_xlo_0 = wrf_zw_x(ph_xlo_n, ph_xlo_np1, mu_xlo_n, mu_xlo_np1, ixl, jxm, k  );
+                Real zw_xlo_1 = wrf_zw_x(ph_xlo_n, ph_xlo_np1, mu_xlo_n, mu_xlo_np1, ixl, jxm, k+1);
+                Real zw_xhi_0 = wrf_zw_x(ph_xhi_n, ph_xhi_np1, mu_xhi_n, mu_xhi_np1, ixh, jxm, k  );
+                Real zw_xhi_1 = wrf_zw_x(ph_xhi_n, ph_xhi_np1, mu_xhi_n, mu_xhi_np1, ixh, jxm, k+1);
+                Real zw_ylo_0 = wrf_zw_y(ph_ylo_n, ph_ylo_np1, mu_ylo_n, mu_ylo_np1, iym, jyl, k  );
+                Real zw_ylo_1 = wrf_zw_y(ph_ylo_n, ph_ylo_np1, mu_ylo_n, mu_ylo_np1, iym, jyl, k+1);
+                Real zw_yhi_0 = wrf_zw_y(ph_yhi_n, ph_yhi_np1, mu_yhi_n, mu_yhi_np1, iym, jyh, k  );
+                Real zw_yhi_1 = wrf_zw_y(ph_yhi_n, ph_yhi_np1, mu_yhi_n, mu_yhi_np1, iym, jyh, k+1);
+
+                Real z_erf_0_x = znd(ixl,jxm,k);
+                Real z_erf_1_x = znd(ixl,jxm,k+1);
+                Real z_erf_0_xh = znd(ixh,jxm,k);
+                Real z_erf_1_xh = znd(ixh,jxm,k+1);
+                Real z_erf_0_y = znd(iym,jyl,k);
+                Real z_erf_1_y = znd(iym,jyl,k+1);
+                Real z_erf_0_yh = znd(iym,jyh,k);
+                Real z_erf_1_yh = znd(iym,jyh,k+1);
+                Real z_erf_cc_x  = myhalf * (z_erf_0_x  + z_erf_1_x);
+                Real z_erf_cc_xh = myhalf * (z_erf_0_xh + z_erf_1_xh);
+                Real z_erf_cc_y  = myhalf * (z_erf_0_y  + z_erf_1_y);
+                Real z_erf_cc_yh = myhalf * (z_erf_0_yh + z_erf_1_yh);
+                Real dz_nd_x  = z_erf_1_x  - z_erf_0_x;
+                Real dz_nd_xh = z_erf_1_xh - z_erf_0_xh;
+                Real dz_nd_y  = z_erf_1_y  - z_erf_0_y;
+                Real dz_nd_yh = z_erf_1_yh - z_erf_0_yh;
+
+                Print() << "  k=" << k
+                        << " xlo dz(wrf-erf)=(" << (zw_xlo_0-z_erf_0_x) << "," << (zw_xlo_1-z_erf_1_x) << ")"
+                        << " xhi=(" << (zw_xhi_0-z_erf_0_xh) << "," << (zw_xhi_1-z_erf_1_xh) << ")"
+                        << " ylo=(" << (zw_ylo_0-z_erf_0_y) << "," << (zw_ylo_1-z_erf_1_y) << ")"
+                        << " yhi=(" << (zw_yhi_0-z_erf_0_yh) << "," << (zw_yhi_1-z_erf_1_yh) << ")"
+                        << std::endl;
+                Print() << "      cc-diff wrf(k)-zcc: "
+                        << "xlo=" << (zw_xlo_0-z_erf_cc_x)
+                        << " xhi=" << (zw_xhi_0-z_erf_cc_xh)
+                        << " ylo=" << (zw_ylo_0-z_erf_cc_y)
+                        << " yhi=" << (zw_yhi_0-z_erf_cc_yh)
+                        << " | dz_nd: xlo=" << dz_nd_x
+                        << " xhi=" << dz_nd_xh
+                        << " ylo=" << dz_nd_y
+                        << " yhi=" << dz_nd_yh
+                        << std::endl;
+            }
+            printed = true;
+        }
+    }
+
+    if (dbg_realbdy_zstats_diag && have_wrfbdy_ph &&
+        (std::abs(alpha) < 1.0e-12) && (n_time == 0)) {
+        struct ZStats {
+            Long n = 0;
+            Real minv = std::numeric_limits<Real>::max();
+            Real maxv = -std::numeric_limits<Real>::max();
+            Real sum = 0.0_rt;
+            Real sumabs = 0.0_rt;
+            Long nbad = 0;
+            AMREX_FORCE_INLINE void add(Real v) noexcept {
+                if (!std::isfinite(static_cast<double>(v))) { ++nbad; return; }
+                ++n;
+                minv = std::min(minv, v);
+                maxv = std::max(maxv, v);
+                sum += v;
+                sumabs += std::abs(v);
+            }
+        };
+        auto reduce_stats = [] (ZStats& s) {
+            ParallelDescriptor::ReduceLongSum(s.n);
+            ParallelDescriptor::ReduceLongSum(s.nbad);
+            ParallelDescriptor::ReduceRealMin(s.minv);
+            ParallelDescriptor::ReduceRealMax(s.maxv);
+            ParallelDescriptor::ReduceRealSum(s.sum);
+            ParallelDescriptor::ReduceRealSum(s.sumabs);
+        };
+        auto print_stats = [] (const char* name, const ZStats& s) {
+            if (s.n == 0) {
+                Print() << "  " << name << ": n=0 nbad=" << s.nbad << "\n";
+                return;
+            }
+            Print() << "  " << name
+                    << ": n=" << s.n
+                    << " nbad=" << s.nbad
+                    << " min=" << s.minv
+                    << " max=" << s.maxv
+                    << " mean=" << (s.sum / static_cast<Real>(s.n))
+                    << " absmean=" << (s.sumabs / static_cast<Real>(s.n))
+                    << "\n";
+        };
+
+        const auto& ph_xlo_n = bdy_data_xlo[n_time][WRFBdyVars::PH].const_array();
+        const auto& ph_xhi_n = bdy_data_xhi[n_time][WRFBdyVars::PH].const_array();
+        const auto& ph_ylo_n = bdy_data_ylo[n_time][WRFBdyVars::PH].const_array();
+        const auto& ph_yhi_n = bdy_data_yhi[n_time][WRFBdyVars::PH].const_array();
+        const auto& mu_xlo_n = bdy_data_xlo[n_time][WRFBdyVars::MU].const_array();
+        const auto& mu_xhi_n = bdy_data_xhi[n_time][WRFBdyVars::MU].const_array();
+        const auto& mu_ylo_n = bdy_data_ylo[n_time][WRFBdyVars::MU].const_array();
+        const auto& mu_yhi_n = bdy_data_yhi[n_time][WRFBdyVars::MU].const_array();
+
+        ZStats z_erf_int, z_erf_strip;
+        ZStats z_bdy_xlo, z_bdy_xhi, z_bdy_ylo, z_bdy_yhi;
+        ZStats dz_xlo, dz_xhi, dz_ylo, dz_yhi;
+        const std::array<int,7> k_levels = {0,5,10,20,40,80,119};
+        std::array<ZStats,7> dz_xlo_k, dz_xhi_k, dz_ylo_k, dz_yhi_k;
+        int bad_print_cap = 8;
+        int bad_print_xlo = 0, bad_print_xhi = 0, bad_print_ylo = 0, bad_print_yhi = 0;
+
+        const Box dom = geom.Domain();
+        const int ilo = dom.smallEnd(0), ihi = dom.bigEnd(0);
+        const int jlo = dom.smallEnd(1), jhi = dom.bigEnd(1);
+        const int knd_hi = dom.bigEnd(2) + 1;
+        const int k_bdy_max = dom.bigEnd(2); // exclude top nodal level where xmu_mult_f can be zero
+        const Real ginv = Real(1.0) / Real(9.81);
+
+        for (MFIter mfi(z_phys_nd); mfi.isValid(); ++mfi) {
+            const auto znd = z_phys_nd.const_array(mfi);
+            const auto phb = mf_PHB_wrfin.const_array(mfi);
+            const auto mub = mf_MUB.const_array(mfi);
+            const auto c1f = mf_C1F.const_array(mfi);
+            const auto c2f = mf_C2F.const_array(mfi);
+            const int kmax_cf = mf_C1F[mfi].box().bigEnd(2);
+            const Box bx = mfi.validbox() & amrex::surroundingNodes(dom);
+            if (!bx.ok()) continue;
+
+            for (int k = bx.smallEnd(2); k <= bx.bigEnd(2); ++k) {
+                for (int j = bx.smallEnd(1); j <= bx.bigEnd(1); ++j) {
+                    for (int i = bx.smallEnd(0); i <= bx.bigEnd(0); ++i) {
+                        const bool in_xlo = (width > 0) && (i <= ilo + width - 1);
+                        const bool in_xhi = (width > 0) && (i >= ihi - width + 1);
+                        const bool in_ylo = (width > 0) && (j <= jlo + width - 1);
+                        const bool in_yhi = (width > 0) && (j >= jhi - width + 1);
+                        const bool in_strip = in_xlo || in_xhi || in_ylo || in_yhi;
+                        if (in_strip) z_erf_strip.add(znd(i,j,k));
+                        else          z_erf_int.add(znd(i,j,k));
+                    }
+                }
+            }
+
+            // Face xlo/xhi: index with global i,j in boundary FABs, b implicit by i offset
+            for (int b = 0; b < width; ++b) {
+                int ixlo = ilo + b;
+                int ixhi = ihi - b;
+                for (int j = std::max(jlo, bx.smallEnd(1)); j <= std::min(jhi, bx.bigEnd(1)); ++j) {
+                    for (int k = std::max(0, bx.smallEnd(2)); k <= std::min(k_bdy_max, bx.bigEnd(2)); ++k) {
+                        if (ixlo >= bx.smallEnd(0) && ixlo <= bx.bigEnd(0)) {
+                            const int kcf = std::min(k, kmax_cf);
+                            const Real mu_d_l = mu_xlo_n(ixlo,j,0,0) + mub(ixlo,j,0,0);
+                            const Real xmul_l = c1f(0,0,kcf,0) * mu_d_l + c2f(0,0,kcf,0);
+                            const Real zbl = (ph_xlo_n(ixlo,j,k,0) / xmul_l + phb(ixlo,j,k,0)) * ginv;
+                            if ((!std::isfinite(static_cast<double>(zbl)) || !std::isfinite(static_cast<double>(xmul_l)) || std::abs(xmul_l) < 1.0e-14) &&
+                                bad_print_xlo < bad_print_cap && ParallelDescriptor::IOProcessor()) {
+                                ++bad_print_xlo;
+                                Print() << "[DBG_ZBAD xlo] i=" << ixlo << " j=" << j << " k=" << k
+                                        << " PH_B=" << ph_xlo_n(ixlo,j,k,0)
+                                        << " PHB=" << phb(ixlo,j,k,0)
+                                        << " MU_B=" << mu_xlo_n(ixlo,j,0,0)
+                                        << " MUB=" << mub(ixlo,j,0,0)
+                                        << " xmu_mult=" << xmul_l
+                                        << " z_bdy=" << zbl << "\n";
+                            }
+                            const Real dd = zbl - znd(ixlo,j,k);
+                            z_bdy_xlo.add(zbl); dz_xlo.add(dd);
+                            for (int ik=0; ik<7; ++ik) if (k == k_levels[ik]) dz_xlo_k[ik].add(dd);
+                        }
+                        if (ixhi >= bx.smallEnd(0) && ixhi <= bx.bigEnd(0)) {
+                            const int kcf = std::min(k, kmax_cf);
+                            const Real mu_d_h = mu_xhi_n(ixhi,j,0,0) + mub(ixhi,j,0,0);
+                            const Real xmul_h = c1f(0,0,kcf,0) * mu_d_h + c2f(0,0,kcf,0);
+                            const Real zbh = (ph_xhi_n(ixhi,j,k,0) / xmul_h + phb(ixhi,j,k,0)) * ginv;
+                            if ((!std::isfinite(static_cast<double>(zbh)) || !std::isfinite(static_cast<double>(xmul_h)) || std::abs(xmul_h) < 1.0e-14) &&
+                                bad_print_xhi < bad_print_cap && ParallelDescriptor::IOProcessor()) {
+                                ++bad_print_xhi;
+                                Print() << "[DBG_ZBAD xhi] i=" << ixhi << " j=" << j << " k=" << k
+                                        << " PH_B=" << ph_xhi_n(ixhi,j,k,0)
+                                        << " PHB=" << phb(ixhi,j,k,0)
+                                        << " MU_B=" << mu_xhi_n(ixhi,j,0,0)
+                                        << " MUB=" << mub(ixhi,j,0,0)
+                                        << " xmu_mult=" << xmul_h
+                                        << " z_bdy=" << zbh << "\n";
+                            }
+                            const Real dd = zbh - znd(ixhi,j,k);
+                            z_bdy_xhi.add(zbh); dz_xhi.add(dd);
+                            for (int ik=0; ik<7; ++ik) if (k == k_levels[ik]) dz_xhi_k[ik].add(dd);
+                        }
+                    }
+                }
+            }
+
+            // Face ylo/yhi
+            for (int b = 0; b < width; ++b) {
+                int jylo = jlo + b;
+                int jyhi = jhi - b;
+                for (int i = std::max(ilo, bx.smallEnd(0)); i <= std::min(ihi, bx.bigEnd(0)); ++i) {
+                    for (int k = std::max(0, bx.smallEnd(2)); k <= std::min(k_bdy_max, bx.bigEnd(2)); ++k) {
+                        if (jylo >= bx.smallEnd(1) && jylo <= bx.bigEnd(1)) {
+                            const int kcf = std::min(k, kmax_cf);
+                            const Real mu_d_l = mu_ylo_n(i,jylo,0,0) + mub(i,jylo,0,0);
+                            const Real xmul_l = c1f(0,0,kcf,0) * mu_d_l + c2f(0,0,kcf,0);
+                            const Real zbl = (ph_ylo_n(i,jylo,k,0) / xmul_l + phb(i,jylo,k,0)) * ginv;
+                            if ((!std::isfinite(static_cast<double>(zbl)) || !std::isfinite(static_cast<double>(xmul_l)) || std::abs(xmul_l) < 1.0e-14) &&
+                                bad_print_ylo < bad_print_cap && ParallelDescriptor::IOProcessor()) {
+                                ++bad_print_ylo;
+                                Print() << "[DBG_ZBAD ylo] i=" << i << " j=" << jylo << " k=" << k
+                                        << " PH_B=" << ph_ylo_n(i,jylo,k,0)
+                                        << " PHB=" << phb(i,jylo,k,0)
+                                        << " MU_B=" << mu_ylo_n(i,jylo,0,0)
+                                        << " MUB=" << mub(i,jylo,0,0)
+                                        << " xmu_mult=" << xmul_l
+                                        << " z_bdy=" << zbl << "\n";
+                            }
+                            const Real dd = zbl - znd(i,jylo,k);
+                            z_bdy_ylo.add(zbl); dz_ylo.add(dd);
+                            for (int ik=0; ik<7; ++ik) if (k == k_levels[ik]) dz_ylo_k[ik].add(dd);
+                        }
+                        if (jyhi >= bx.smallEnd(1) && jyhi <= bx.bigEnd(1)) {
+                            const int kcf = std::min(k, kmax_cf);
+                            const Real mu_d_h = mu_yhi_n(i,jyhi,0,0) + mub(i,jyhi,0,0);
+                            const Real xmul_h = c1f(0,0,kcf,0) * mu_d_h + c2f(0,0,kcf,0);
+                            const Real zbh = (ph_yhi_n(i,jyhi,k,0) / xmul_h + phb(i,jyhi,k,0)) * ginv;
+                            if ((!std::isfinite(static_cast<double>(zbh)) || !std::isfinite(static_cast<double>(xmul_h)) || std::abs(xmul_h) < 1.0e-14) &&
+                                bad_print_yhi < bad_print_cap && ParallelDescriptor::IOProcessor()) {
+                                ++bad_print_yhi;
+                                Print() << "[DBG_ZBAD yhi] i=" << i << " j=" << jyhi << " k=" << k
+                                        << " PH_B=" << ph_yhi_n(i,jyhi,k,0)
+                                        << " PHB=" << phb(i,jyhi,k,0)
+                                        << " MU_B=" << mu_yhi_n(i,jyhi,0,0)
+                                        << " MUB=" << mub(i,jyhi,0,0)
+                                        << " xmu_mult=" << xmul_h
+                                        << " z_bdy=" << zbh << "\n";
+                            }
+                            const Real dd = zbh - znd(i,jyhi,k);
+                            z_bdy_yhi.add(zbh); dz_yhi.add(dd);
+                            for (int ik=0; ik<7; ++ik) if (k == k_levels[ik]) dz_yhi_k[ik].add(dd);
+                        }
+                    }
+                }
+            }
+        }
+
+        reduce_stats(z_erf_int); reduce_stats(z_erf_strip);
+        reduce_stats(z_bdy_xlo); reduce_stats(z_bdy_xhi); reduce_stats(z_bdy_ylo); reduce_stats(z_bdy_yhi);
+        reduce_stats(dz_xlo); reduce_stats(dz_xhi); reduce_stats(dz_ylo); reduce_stats(dz_yhi);
+        for (int ik=0; ik<7; ++ik) {
+            reduce_stats(dz_xlo_k[ik]); reduce_stats(dz_xhi_k[ik]);
+            reduce_stats(dz_ylo_k[ik]); reduce_stats(dz_yhi_k[ik]);
+        }
+
+        if (ParallelDescriptor::IOProcessor()) {
+            Print() << "[DBG_ZSTATS init-vs-bdy] width=" << width << " n_time=" << n_time << " alpha=" << alpha << "\n";
+            print_stats("z_erf_interior", z_erf_int);
+            print_stats("z_erf_strip",    z_erf_strip);
+            print_stats("z_bdy_xlo",      z_bdy_xlo);
+            print_stats("z_bdy_xhi",      z_bdy_xhi);
+            print_stats("z_bdy_ylo",      z_bdy_ylo);
+            print_stats("z_bdy_yhi",      z_bdy_yhi);
+            print_stats("dz_xlo(bdy-erf)", dz_xlo);
+            print_stats("dz_xhi(bdy-erf)", dz_xhi);
+            print_stats("dz_ylo(bdy-erf)", dz_ylo);
+            print_stats("dz_yhi(bdy-erf)", dz_yhi);
+            for (int ik=0; ik<7; ++ik) {
+                std::string hdr = "k=" + std::to_string(k_levels[ik]);
+                Print() << "  [DZ_BY_K " << hdr << "]\n";
+                print_stats("    xlo", dz_xlo_k[ik]);
+                print_stats("    xhi", dz_xhi_k[ik]);
+                print_stats("    ylo", dz_ylo_k[ik]);
+                print_stats("    yhi", dz_yhi_k[ik]);
+            }
+        }
+    }
+#endif
 
     /*
     // UNIT TEST DEBUG
@@ -338,6 +1104,16 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
         const auto& dom_cc_lo = lbound(geom.Domain());
         const auto& dom_cc_hi = ubound(geom.Domain());
 
+        MultiFab mf_theta_dbg;
+        Array4<Real> theta_dbg_arr;
+        const bool do_dump_theta_for_var = do_dump_theta_this_rhs && (ivar == ivarU || ivar == ivarV || ivar == ivarT);
+        if (do_dump_theta_for_var) {
+            mf_theta_dbg.define(S_cur_data[ivar_idx].boxArray(),
+                                S_cur_data[ivar_idx].DistributionMap(),
+                                3, 0);
+            mf_theta_dbg.setVal(std::numeric_limits<Real>::quiet_NaN());
+        }
+
 #ifdef _OPENMP
 #pragma omp parallel if (Gpu::notInLaunchRegion())
 #endif
@@ -380,6 +1156,67 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
 
             // Current density to convert to conserved vars
             Array4<Real> r_arr = S_cur_data[IntVars::cons].array(mfi);
+            Array4<Real const> state_arr = S_cur_data[ivar_idx].const_array(mfi);
+            Array4<Real const> state_cons_arr = S_cur_data[ivar_map[ivar]].const_array(mfi);
+            if (do_dump_theta_for_var) {
+                theta_dbg_arr = mf_theta_dbg.array(mfi);
+            }
+            Array4<Real const> mub_arr = mf_MUB.const_array(mfi);
+            Array4<Real const> c1h_arr = mf_C1H.const_array(mfi);
+            Array4<Real const> c2h_arr = mf_C2H.const_array(mfi);
+            Array4<Real const> c1f_arr = mf_C1F.const_array(mfi);
+            Array4<Real const> c2f_arr = mf_C2F.const_array(mfi);
+            Array4<Real const> dnw_arr = mf_DNW.const_array(mfi);
+            Array4<Real const> phb_arr = mf_PHB_wrfin.const_array(mfi);
+            Array4<Real const> zcc_arr = z_phys_cc.const_array(mfi);
+
+            const auto& bdatxlo_mu_n   = bdy_data_xlo[n_time   ][WRFBdyVars::MU].const_array();
+            const auto& bdatxlo_mu_np1 = bdy_data_xlo[n_time_p1][WRFBdyVars::MU].const_array();
+            const auto& bdatxhi_mu_n   = bdy_data_xhi[n_time   ][WRFBdyVars::MU].const_array();
+            const auto& bdatxhi_mu_np1 = bdy_data_xhi[n_time_p1][WRFBdyVars::MU].const_array();
+            const auto& bdatylo_mu_n   = bdy_data_ylo[n_time   ][WRFBdyVars::MU].const_array();
+            const auto& bdatylo_mu_np1 = bdy_data_ylo[n_time_p1][WRFBdyVars::MU].const_array();
+            const auto& bdatyhi_mu_n   = bdy_data_yhi[n_time   ][WRFBdyVars::MU].const_array();
+            const auto& bdatyhi_mu_np1 = bdy_data_yhi[n_time_p1][WRFBdyVars::MU].const_array();
+            const auto& bdatxlo_ph_n   = have_wrfbdy_ph ? bdy_data_xlo[n_time   ][WRFBdyVars::PH].const_array() : bdy_data_xlo[n_time][WRFBdyVars::T].const_array();
+            const auto& bdatxlo_ph_np1 = have_wrfbdy_ph ? bdy_data_xlo[n_time_p1][WRFBdyVars::PH].const_array() : bdy_data_xlo[n_time_p1][WRFBdyVars::T].const_array();
+            const auto& bdatxhi_ph_n   = have_wrfbdy_ph ? bdy_data_xhi[n_time   ][WRFBdyVars::PH].const_array() : bdy_data_xhi[n_time][WRFBdyVars::T].const_array();
+            const auto& bdatxhi_ph_np1 = have_wrfbdy_ph ? bdy_data_xhi[n_time_p1][WRFBdyVars::PH].const_array() : bdy_data_xhi[n_time_p1][WRFBdyVars::T].const_array();
+            const auto& bdatylo_ph_n   = have_wrfbdy_ph ? bdy_data_ylo[n_time   ][WRFBdyVars::PH].const_array() : bdy_data_ylo[n_time][WRFBdyVars::T].const_array();
+            const auto& bdatylo_ph_np1 = have_wrfbdy_ph ? bdy_data_ylo[n_time_p1][WRFBdyVars::PH].const_array() : bdy_data_ylo[n_time_p1][WRFBdyVars::T].const_array();
+            const auto& bdatyhi_ph_n   = have_wrfbdy_ph ? bdy_data_yhi[n_time   ][WRFBdyVars::PH].const_array() : bdy_data_yhi[n_time][WRFBdyVars::T].const_array();
+            const auto& bdatyhi_ph_np1 = have_wrfbdy_ph ? bdy_data_yhi[n_time_p1][WRFBdyVars::PH].const_array() : bdy_data_yhi[n_time_p1][WRFBdyVars::T].const_array();
+            const int kmax_ph_xlo = have_wrfbdy_ph ? bdy_data_xlo[n_time][WRFBdyVars::PH].box().bigEnd(2) : dom_hi.z;
+            const int kmax_ph_xhi = have_wrfbdy_ph ? bdy_data_xhi[n_time][WRFBdyVars::PH].box().bigEnd(2) : dom_hi.z;
+            const int kmax_ph_ylo = have_wrfbdy_ph ? bdy_data_ylo[n_time][WRFBdyVars::PH].box().bigEnd(2) : dom_hi.z;
+            const int kmax_ph_yhi = have_wrfbdy_ph ? bdy_data_yhi[n_time][WRFBdyVars::PH].box().bigEnd(2) : dom_hi.z;
+            const int kmax_t_xlo = bdy_data_xlo[n_time][ivar].box().bigEnd(2);
+            const int kmax_t_xhi = bdy_data_xhi[n_time][ivar].box().bigEnd(2);
+            const int kmax_t_ylo = bdy_data_ylo[n_time][ivar].box().bigEnd(2);
+            const int kmax_t_yhi = bdy_data_yhi[n_time][ivar].box().bigEnd(2);
+            auto z_tgt_loc = [=] AMREX_GPU_DEVICE (int ivar_loc, int i_loc, int j_loc, int k_loc) noexcept -> Real {
+                return realbdy_zcc_to_loc(zcc_arr, dom_cc_lo, dom_cc_hi, i_loc, j_loc, k_loc, ivar_loc, ivarU, ivarV);
+            };
+            if (!dbg_realbdy_boxes_print_once && ParallelDescriptor::IOProcessor()) {
+                const Box bx_xlo_v = bdy_data_xlo[n_time][ivar].box();
+                const Box bx_xhi_v = bdy_data_xhi[n_time][ivar].box();
+                const Box bx_ylo_v = bdy_data_ylo[n_time][ivar].box();
+                const Box bx_yhi_v = bdy_data_yhi[n_time][ivar].box();
+                const Box bx_xhi_mu = bdy_data_xhi[n_time][WRFBdyVars::MU].box();
+                const Box bx_yhi_mu = bdy_data_yhi[n_time][WRFBdyVars::MU].box();
+                const Box bx_xhi_ph = have_wrfbdy_ph ? bdy_data_xhi[n_time][WRFBdyVars::PH].box() : Box();
+                const Box bx_yhi_ph = have_wrfbdy_ph ? bdy_data_yhi[n_time][WRFBdyVars::PH].box() : Box();
+                std::string vname = (ivar==ivarU) ? "U" : ((ivar==ivarV) ? "V" : "T");
+                Print() << "[DBG_REALBDY_BOXES " << vname << "] "
+                        << "xlo=" << bx_xlo_v << " xhi=" << bx_xhi_v
+                        << " ylo=" << bx_ylo_v << " yhi=" << bx_yhi_v
+                        << " | MU xhi=" << bx_xhi_mu << " yhi=" << bx_yhi_mu;
+                if (have_wrfbdy_ph) {
+                    Print() << " | PH xhi=" << bx_xhi_ph << " yhi=" << bx_yhi_ph;
+                }
+                Print() << "\n";
+                if (ivar == ivarT) dbg_realbdy_boxes_print_once = true;
+            }
 
             // Limiting offset
             int offset = width - 1;
@@ -389,17 +1226,37 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
             [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept
             {
                 int ii = std::max(i , dom_lo.x);
-                    ii = std::min(ii, dom_lo.x+offset);
+                    ii = std::min(ii, dom_lo.x + offset + ((ivar==ivarU) ? 1 : 0));
                 int jj = std::max(j , dom_lo.y);
-                    jj = std::min(jj, dom_hi.y);
+                    jj = std::min(jj, dom_hi.y + ((ivar==ivarV) ? 1 : 0));
 
                 Real rho_interp;
-                if (ivar==ivarU) {
-                    rho_interp = myhalf * ( r_arr(i-1,j  ,k) + r_arr(i,j,k) );
-                } else if (ivar==ivarV) {
-                    rho_interp = myhalf * ( r_arr(i  ,j-1,k) + r_arr(i,j,k) );
+                if (!use_wrf_rho_interp) {
+                    if (ivar==ivarU) {
+                        rho_interp = myhalf * ( r_arr(i-1,j  ,k) + r_arr(i,j,k) );
+                    } else if (ivar==ivarV) {
+                        rho_interp = myhalf * ( r_arr(i  ,j-1,k) + r_arr(i,j,k) );
+                    } else {
+                        rho_interp = r_arr(i,j,k);
+                    }
                 } else {
-                    rho_interp = r_arr(i,j,k);
+                    auto rho_cc = [&] AMREX_GPU_DEVICE (int ic, int jc, int kc) noexcept -> Real {
+                        kc = amrex::max(0, amrex::min(kc, kmax_ph_xlo-1));
+                        Real mu_t = oma * bdatxlo_mu_n(ic,jc,0,0) + alpha * bdatxlo_mu_np1(ic,jc,0,0) + mub_arr(ic,jc,0);
+                        Real xmu_mult_h = c1h_arr(0,0,kc) * mu_t + c2h_arr(0,0,kc);
+                        Real dpd = xmu_mult_h * amrex::Math::abs(dnw_arr(0,0,kc));
+                        Real phi_k   = oma * bdatxlo_ph_n(ic,jc,kc,0)   + alpha * bdatxlo_ph_np1(ic,jc,kc,0)   + phb_arr(ic,jc,kc);
+                        Real phi_kp1 = oma * bdatxlo_ph_n(ic,jc,kc+1,0) + alpha * bdatxlo_ph_np1(ic,jc,kc+1,0) + phb_arr(ic,jc,kc+1);
+                        Real dphi = amrex::max(phi_kp1 - phi_k, Real(1.0e-12));
+                        return dpd / dphi;
+                    };
+                    if (ivar==ivarU) {
+                        rho_interp = myhalf * ( rho_cc(i-1,j,k) + rho_cc(i,j,k) );
+                    } else if (ivar==ivarV) {
+                        rho_interp = myhalf * ( rho_cc(i,j-1,k) + rho_cc(i,j,k) );
+                    } else {
+                        rho_interp = rho_cc(i,j,k);
+                    }
                 }
 
                 if (bdatxlo) {
@@ -407,24 +1264,255 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
                     int jj2 = std::min(std::max(j , dom_cc_lo.y), dom_cc_hi.y);
                     arr_xlo(i,j,k) = rho_interp * bdatxlo(ii2,jj2,k,bdy_comp);
                 } else {
-                    arr_xlo(i,j,k) = rho_interp * ( oma   * bdatxlo_n  (ii,jj,k,0)
-                                                  + alpha * bdatxlo_np1(ii,jj,k,0) );
+                    Real theta_base = oma * bdatxlo_n(ii,jj,k,0) + alpha * bdatxlo_np1(ii,jj,k,0);
+                    Real theta_t = theta_base;
+                    if (use_theta_vertical_remap) {
+                        const int ksrc_max = amrex::min(kmax_t_xlo, kmax_ph_xlo-1);
+                        auto z_target_cc = [&](int ic, int jc, int kk) AMREX_GPU_DEVICE noexcept -> Real {
+                            Real mu_t = oma * bdatxlo_mu_n(ic,jc,0,0) + alpha * bdatxlo_mu_np1(ic,jc,0,0) + mub_arr(ic,jc,0);
+                            Real xmu_f = c1f_arr(0,0,kk) * mu_t + c2f_arr(0,0,kk);
+                            Real ph_t = oma * bdatxlo_ph_n(ic,jc,kk,0) + alpha * bdatxlo_ph_np1(ic,jc,kk,0);
+                            return (ph_t / xmu_f + phb_arr(ic,jc,kk)) / CONST_GRAV;
+                        };
+
+                        if (realbdy_vertical_remap_mode == 2 && (ivar == ivarU || ivar == ivarV) && ksrc_max > 0) {
+                            // Path B: remap target profile at adjacent cc columns, then average remapped
+                            // primitive values to the face before converting to conserved form.
+                            auto src_target_cc = [&](int icc, int jcc, int kk) AMREX_GPU_DEVICE noexcept -> Real {
+                                if (ivar == ivarU) {
+                                    int i0 = amrex::min(amrex::max(icc,   dom_lo.x), dom_hi.x);
+                                    int i1 = amrex::min(amrex::max(icc+1, dom_lo.x), dom_hi.x);
+                                    int jc = amrex::min(amrex::max(jcc,   dom_lo.y), dom_hi.y);
+                                    Real u0 = oma * bdatxlo_n(i0,jc,kk,0) + alpha * bdatxlo_np1(i0,jc,kk,0);
+                                    Real u1 = oma * bdatxlo_n(i1,jc,kk,0) + alpha * bdatxlo_np1(i1,jc,kk,0);
+                                    return Real(0.5) * (u0 + u1);
+                                } else {
+                                    int ic = amrex::min(amrex::max(icc,   dom_lo.x), dom_hi.x);
+                                    int j0 = amrex::min(amrex::max(jcc,   dom_lo.y), dom_hi.y);
+                                    int j1 = amrex::min(amrex::max(jcc+1, dom_lo.y), dom_hi.y);
+                                    Real v0 = oma * bdatxlo_n(ic,j0,kk,0) + alpha * bdatxlo_np1(ic,j0,kk,0);
+                                    Real v1 = oma * bdatxlo_n(ic,j1,kk,0) + alpha * bdatxlo_np1(ic,j1,kk,0);
+                                    return Real(0.5) * (v0 + v1);
+                                }
+                            };
+                            auto remap_target_cc = [&](int icc, int jcc) AMREX_GPU_DEVICE noexcept -> Real {
+                                const Real z_state_cc = zcc_arr(icc,jcc,k,0);
+                                Real z0 = Real(0.5) * (z_target_cc(icc,jcc,0) + z_target_cc(icc,jcc,1));
+                                Real f0 = src_target_cc(icc,jcc,0);
+                                if (z_state_cc <= z0) { return f0; }
+                                for (int kk = 0; kk < ksrc_max; ++kk) {
+                                    Real zl = Real(0.5) * (z_target_cc(icc,jcc,kk) + z_target_cc(icc,jcc,kk+1));
+                                    Real zh = Real(0.5) * (z_target_cc(icc,jcc,kk+1) + z_target_cc(icc,jcc,kk+2));
+                                    if (z_state_cc <= zh || kk == ksrc_max-1) {
+                                        Real fl = src_target_cc(icc,jcc,kk);
+                                        Real fh = src_target_cc(icc,jcc,kk+1);
+                                        Real dz = amrex::max(zh-zl, Real(1.e-12));
+                                        Real lam = (z_state_cc - zl) / dz;
+                                        lam = amrex::max(Real(0.0), amrex::min(Real(1.0), lam));
+                                        return (Real(1.0)-lam)*fl + lam*fh;
+                                    }
+                                }
+                                return src_target_cc(icc,jcc,ksrc_max);
+                            };
+                            if (ivar == ivarU) {
+                                int iL = amrex::min(amrex::max(i-1, dom_cc_lo.x), dom_cc_hi.x);
+                                int iR = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                int jC = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                theta_t = Real(0.5) * (remap_target_cc(iL,jC) + remap_target_cc(iR,jC));
+                            } else {
+                                int iC = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                int jL = amrex::min(amrex::max(j-1, dom_cc_lo.y), dom_cc_hi.y);
+                                int jR = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                theta_t = Real(0.5) * (remap_target_cc(iC,jL) + remap_target_cc(iC,jR));
+                            }
+                        } else if ((realbdy_vertical_remap_mode == 3 ||
+                                    realbdy_vertical_remap_mode == 4) &&
+                                   (ivar == ivarU || ivar == ivarV) && ksrc_max > 0) {
+                            // Path C/D: remap target at cc columns and form deltas at cc.
+                            // C: average primitive delta to face.
+                            // D: average conserved delta (rho_cc * primitive_delta) to face.
+                            auto src_target_cc = [&](int icc, int jcc, int kk) AMREX_GPU_DEVICE noexcept -> Real {
+                                if (ivar == ivarU) {
+                                    int i0 = amrex::min(amrex::max(icc,   dom_lo.x), dom_hi.x);
+                                    int i1 = amrex::min(amrex::max(icc+1, dom_lo.x), dom_hi.x);
+                                    int jc = amrex::min(amrex::max(jcc,   dom_lo.y), dom_hi.y);
+                                    Real u0 = oma * bdatxlo_n(i0,jc,kk,0) + alpha * bdatxlo_np1(i0,jc,kk,0);
+                                    Real u1 = oma * bdatxlo_n(i1,jc,kk,0) + alpha * bdatxlo_np1(i1,jc,kk,0);
+                                    return Real(0.5) * (u0 + u1);
+                                } else {
+                                    int ic = amrex::min(amrex::max(icc,   dom_lo.x), dom_hi.x);
+                                    int j0 = amrex::min(amrex::max(jcc,   dom_lo.y), dom_hi.y);
+                                    int j1 = amrex::min(amrex::max(jcc+1, dom_lo.y), dom_hi.y);
+                                    Real v0 = oma * bdatxlo_n(ic,j0,kk,0) + alpha * bdatxlo_np1(ic,j0,kk,0);
+                                    Real v1 = oma * bdatxlo_n(ic,j1,kk,0) + alpha * bdatxlo_np1(ic,j1,kk,0);
+                                    return Real(0.5) * (v0 + v1);
+                                }
+                            };
+                            auto remap_target_cc = [&](int icc, int jcc) AMREX_GPU_DEVICE noexcept -> Real {
+                                const Real z_state_cc = zcc_arr(icc,jcc,k,0);
+                                Real z0 = Real(0.5) * (z_target_cc(icc,jcc,0) + z_target_cc(icc,jcc,1));
+                                Real f0 = src_target_cc(icc,jcc,0);
+                                if (z_state_cc <= z0) { return f0; }
+                                for (int kk = 0; kk < ksrc_max; ++kk) {
+                                    Real zl = Real(0.5) * (z_target_cc(icc,jcc,kk) + z_target_cc(icc,jcc,kk+1));
+                                    Real zh = Real(0.5) * (z_target_cc(icc,jcc,kk+1) + z_target_cc(icc,jcc,kk+2));
+                                    if (z_state_cc <= zh || kk == ksrc_max-1) {
+                                        Real fl = src_target_cc(icc,jcc,kk);
+                                        Real fh = src_target_cc(icc,jcc,kk+1);
+                                        Real dz = amrex::max(zh-zl, Real(1.e-12));
+                                        Real lam = (z_state_cc - zl) / dz;
+                                        lam = amrex::max(Real(0.0), amrex::min(Real(1.0), lam));
+                                        return (Real(1.0)-lam)*fl + lam*fh;
+                                    }
+                                }
+                                return src_target_cc(icc,jcc,ksrc_max);
+                            };
+                            auto state_cc = [&](int icc, int jcc) AMREX_GPU_DEVICE noexcept -> Real {
+                                if (ivar == ivarU) {
+                                    int i0 = amrex::min(amrex::max(icc,   dom_cc_lo.x), dom_cc_hi.x);
+                                    int i1 = amrex::min(amrex::max(icc+1, dom_cc_lo.x), dom_cc_hi.x+1);
+                                    int jc = amrex::min(amrex::max(jcc,   dom_cc_lo.y), dom_cc_hi.y);
+                                    return Real(0.5) * (state_arr(i0,jc,k,0) + state_arr(i1,jc,k,0));
+                                } else {
+                                    int ic = amrex::min(amrex::max(icc,   dom_cc_lo.x), dom_cc_hi.x);
+                                    int j0 = amrex::min(amrex::max(jcc,   dom_cc_lo.y), dom_cc_hi.y);
+                                    int j1 = amrex::min(amrex::max(jcc+1, dom_cc_lo.y), dom_cc_hi.y+1);
+                                    return Real(0.5) * (state_arr(ic,j0,k,0) + state_arr(ic,j1,k,0));
+                                }
+                            };
+                            auto rho_state_cc = [&](int icc, int jcc) AMREX_GPU_DEVICE noexcept -> Real {
+                                int kc = amrex::max(0, amrex::min(k, kmax_ph_xlo-1));
+                                Real mu_t = oma * bdatxlo_mu_n(icc,jcc,0,0) + alpha * bdatxlo_mu_np1(icc,jcc,0,0) + mub_arr(icc,jcc,0);
+                                Real xmu_mult_h = c1h_arr(0,0,kc) * mu_t + c2h_arr(0,0,kc);
+                                Real dpd = xmu_mult_h * amrex::Math::abs(dnw_arr(0,0,kc));
+                                Real phi_k   = oma * bdatxlo_ph_n(icc,jcc,kc,0)   + alpha * bdatxlo_ph_np1(icc,jcc,kc,0)   + phb_arr(icc,jcc,kc);
+                                Real phi_kp1 = oma * bdatxlo_ph_n(icc,jcc,kc+1,0) + alpha * bdatxlo_ph_np1(icc,jcc,kc+1,0) + phb_arr(icc,jcc,kc+1);
+                                Real dphi = amrex::max(phi_kp1 - phi_k, Real(1.0e-12));
+                                return dpd / dphi;
+                            };
+                            if (ivar == ivarU) {
+                                int iL = amrex::min(amrex::max(i-1, dom_cc_lo.x), dom_cc_hi.x);
+                                int iR = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                int jC = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                Real deltaL = remap_target_cc(iL,jC) - state_cc(iL,jC);
+                                Real deltaR = remap_target_cc(iR,jC) - state_cc(iR,jC);
+                                if (realbdy_vertical_remap_mode == 3) {
+                                    Real delta_face = Real(0.5) * (deltaL + deltaR);
+                                    theta_t = state_arr(i,j,k,0) + delta_face;
+                                } else {
+                                    Real dconsL = rho_state_cc(iL,jC) * deltaL;
+                                    Real dconsR = rho_state_cc(iR,jC) * deltaR;
+                                    Real dcons_face = Real(0.5) * (dconsL + dconsR);
+                                    Real cons_target = state_cons_arr(i,j,k,0) + dcons_face;
+                                    Real rho_safe = (amrex::Math::abs(rho_interp) > Real(1.0e-12)) ? rho_interp : Real(1.0e-12);
+                                    theta_t = cons_target / rho_safe;
+                                }
+                            } else {
+                                int iC = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                int jL = amrex::min(amrex::max(j-1, dom_cc_lo.y), dom_cc_hi.y);
+                                int jR = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                Real deltaL = remap_target_cc(iC,jL) - state_cc(iC,jL);
+                                Real deltaR = remap_target_cc(iC,jR) - state_cc(iC,jR);
+                                if (realbdy_vertical_remap_mode == 3) {
+                                    Real delta_face = Real(0.5) * (deltaL + deltaR);
+                                    theta_t = state_arr(i,j,k,0) + delta_face;
+                                } else {
+                                    Real dconsL = rho_state_cc(iC,jL) * deltaL;
+                                    Real dconsR = rho_state_cc(iC,jR) * deltaR;
+                                    Real dcons_face = Real(0.5) * (dconsL + dconsR);
+                                    Real cons_target = state_cons_arr(i,j,k,0) + dcons_face;
+                                    Real rho_safe = (amrex::Math::abs(rho_interp) > Real(1.0e-12)) ? rho_interp : Real(1.0e-12);
+                                    theta_t = cons_target / rho_safe;
+                                }
+                            }
+                        } else {
+                            // Path A-2: remap target profile directly at the state variable location.
+                            const Real z_state = z_tgt_loc(ivar, i, j, k);
+                            auto z_target = [&](int kk) AMREX_GPU_DEVICE noexcept -> Real {
+                                if (ivar == ivarU) {
+                                    int iL = amrex::min(amrex::max(i-1, dom_cc_lo.x), dom_cc_hi.x);
+                                    int iR = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                    int jC = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                    return Real(0.5) * (z_target_cc(iL,jC,kk) + z_target_cc(iR,jC,kk));
+                                } else if (ivar == ivarV) {
+                                    int iC = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                    int jL = amrex::min(amrex::max(j-1, dom_cc_lo.y), dom_cc_hi.y);
+                                    int jR = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                    return Real(0.5) * (z_target_cc(iC,jL,kk) + z_target_cc(iC,jR,kk));
+                                } else {
+                                    int iC = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                    int jC = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                    return z_target_cc(iC,jC,kk);
+                                }
+                            };
+                            if (ksrc_max > 0) {
+                                Real z0 = Real(0.5) * (z_target(0) + z_target(1));
+                                Real t0 = oma * bdatxlo_n(ii,jj,0,0) + alpha * bdatxlo_np1(ii,jj,0,0);
+                                if (z_state <= z0) {
+                                    theta_t = t0;
+                                } else {
+                                    bool found = false;
+                                    for (int kk = 0; kk < ksrc_max; ++kk) {
+                                        Real zl = Real(0.5) * (z_target(kk) + z_target(kk+1));
+                                        Real zh = Real(0.5) * (z_target(kk+1) + z_target(kk+2));
+                                        if (z_state <= zh || kk == ksrc_max-1) {
+                                            Real tl = oma * bdatxlo_n(ii,jj,kk,0) + alpha * bdatxlo_np1(ii,jj,kk,0);
+                                            Real th = oma * bdatxlo_n(ii,jj,kk+1,0) + alpha * bdatxlo_np1(ii,jj,kk+1,0);
+                                            Real dz = amrex::max(zh-zl, Real(1.e-12));
+                                            Real lam = (z_state - zl) / dz;
+                                            lam = amrex::max(Real(0.0), amrex::min(Real(1.0), lam));
+                                            theta_t = (Real(1.0)-lam)*tl + lam*th;
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!found) { theta_t = oma * bdatxlo_n(ii,jj,ksrc_max,0) + alpha * bdatxlo_np1(ii,jj,ksrc_max,0); }
+                                }
+                            }
+                        }
+                    }
+                    arr_xlo(i,j,k) = rho_interp * theta_t;
+                    if (do_dump_theta_for_var) {
+                        theta_dbg_arr(i,j,k,0) = theta_base;
+                        theta_dbg_arr(i,j,k,1) = theta_t;
+                        theta_dbg_arr(i,j,k,2) = theta_t - theta_base;
+                    }
                 }
             },
             [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept
             {
-                int ii = std::max(i , dom_hi.x-offset);
-                    ii = std::min(ii, dom_hi.x);
+                int ii = std::max(i , dom_hi.x - offset + ((ivar==ivarU) ? 1 : 0));
+                    ii = std::min(ii, dom_hi.x + ((ivar==ivarU) ? 1 : 0));
                 int jj = std::max(j , dom_lo.y);
-                    jj = std::min(jj, dom_hi.y);
+                    jj = std::min(jj, dom_hi.y + ((ivar==ivarV) ? 1 : 0));
 
                 Real rho_interp;
-                if (ivar==ivarU) {
-                    rho_interp = myhalf * ( r_arr(i-1,j  ,k) + r_arr(i,j,k) );
-                } else if (ivar==ivarV) {
-                    rho_interp = myhalf * ( r_arr(i  ,j-1,k) + r_arr(i,j,k) );
+                if (!use_wrf_rho_interp) {
+                    if (ivar==ivarU) {
+                        rho_interp = myhalf * ( r_arr(i-1,j  ,k) + r_arr(i,j,k) );
+                    } else if (ivar==ivarV) {
+                        rho_interp = myhalf * ( r_arr(i  ,j-1,k) + r_arr(i,j,k) );
+                    } else {
+                        rho_interp = r_arr(i,j,k);
+                    }
                 } else {
-                    rho_interp = r_arr(i,j,k);
+                    auto rho_cc = [&] AMREX_GPU_DEVICE (int ic, int jc, int kc) noexcept -> Real {
+                        kc = amrex::max(0, amrex::min(kc, kmax_ph_xhi-1));
+                        Real mu_t = oma * bdatxhi_mu_n(ic,jc,0,0) + alpha * bdatxhi_mu_np1(ic,jc,0,0) + mub_arr(ic,jc,0);
+                        Real xmu_mult_h = c1h_arr(0,0,kc) * mu_t + c2h_arr(0,0,kc);
+                        Real dpd = xmu_mult_h * amrex::Math::abs(dnw_arr(0,0,kc));
+                        Real phi_k   = oma * bdatxhi_ph_n(ic,jc,kc,0)   + alpha * bdatxhi_ph_np1(ic,jc,kc,0)   + phb_arr(ic,jc,kc);
+                        Real phi_kp1 = oma * bdatxhi_ph_n(ic,jc,kc+1,0) + alpha * bdatxhi_ph_np1(ic,jc,kc+1,0) + phb_arr(ic,jc,kc+1);
+                        Real dphi = amrex::max(phi_kp1 - phi_k, Real(1.0e-12));
+                        return dpd / dphi;
+                    };
+                    if (ivar==ivarU) {
+                        rho_interp = myhalf * ( rho_cc(i-1,j,k) + rho_cc(i,j,k) );
+                    } else if (ivar==ivarV) {
+                        rho_interp = myhalf * ( rho_cc(i,j-1,k) + rho_cc(i,j,k) );
+                    } else {
+                        rho_interp = rho_cc(i,j,k);
+                    }
                 }
 
                 if (bdatxhi) {
@@ -432,8 +1520,176 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
                     int jj2 = std::min(std::max(j , dom_cc_lo.y), dom_cc_hi.y);
                     arr_xhi(i,j,k) = rho_interp * bdatxhi(ii2,jj2,k,bdy_comp);
                 } else {
-                    arr_xhi(i,j,k) = rho_interp * ( oma   * bdatxhi_n  (ii,jj,k,0)
-                                                  + alpha * bdatxhi_np1(ii,jj,k,0) );
+                    Real theta_base = oma * bdatxhi_n(ii,jj,k,0) + alpha * bdatxhi_np1(ii,jj,k,0);
+                    Real theta_t = theta_base;
+                    if (use_theta_vertical_remap) {
+                        const int ksrc_max = amrex::min(kmax_t_xhi, kmax_ph_xhi-1);
+                        auto z_target_cc = [&](int ic, int jc, int kk) AMREX_GPU_DEVICE noexcept -> Real {
+                            Real mu_t = oma * bdatxhi_mu_n(ic,jc,0,0) + alpha * bdatxhi_mu_np1(ic,jc,0,0) + mub_arr(ic,jc,0);
+                            Real xmu_f = c1f_arr(0,0,kk) * mu_t + c2f_arr(0,0,kk);
+                            Real ph_t = oma * bdatxhi_ph_n(ic,jc,kk,0) + alpha * bdatxhi_ph_np1(ic,jc,kk,0);
+                            return (ph_t / xmu_f + phb_arr(ic,jc,kk)) / CONST_GRAV;
+                        };
+
+                        if ((realbdy_vertical_remap_mode == 2 ||
+                             realbdy_vertical_remap_mode == 3 ||
+                             realbdy_vertical_remap_mode == 4) &&
+                            (ivar == ivarU || ivar == ivarV) && ksrc_max > 0) {
+                            auto src_target_cc = [&](int icc, int jcc, int kk) AMREX_GPU_DEVICE noexcept -> Real {
+                                if (ivar == ivarU) {
+                                    int i0 = amrex::min(amrex::max(icc,   dom_lo.x), dom_hi.x);
+                                    int i1 = amrex::min(amrex::max(icc+1, dom_lo.x), dom_hi.x);
+                                    int jc = amrex::min(amrex::max(jcc,   dom_lo.y), dom_hi.y);
+                                    Real u0 = oma * bdatxhi_n(i0,jc,kk,0) + alpha * bdatxhi_np1(i0,jc,kk,0);
+                                    Real u1 = oma * bdatxhi_n(i1,jc,kk,0) + alpha * bdatxhi_np1(i1,jc,kk,0);
+                                    return Real(0.5) * (u0 + u1);
+                                } else {
+                                    int ic = amrex::min(amrex::max(icc,   dom_lo.x), dom_hi.x);
+                                    int j0 = amrex::min(amrex::max(jcc,   dom_lo.y), dom_hi.y);
+                                    int j1 = amrex::min(amrex::max(jcc+1, dom_lo.y), dom_hi.y);
+                                    Real v0 = oma * bdatxhi_n(ic,j0,kk,0) + alpha * bdatxhi_np1(ic,j0,kk,0);
+                                    Real v1 = oma * bdatxhi_n(ic,j1,kk,0) + alpha * bdatxhi_np1(ic,j1,kk,0);
+                                    return Real(0.5) * (v0 + v1);
+                                }
+                            };
+                            auto remap_target_cc = [&](int icc, int jcc) AMREX_GPU_DEVICE noexcept -> Real {
+                                const Real z_state_cc = zcc_arr(icc,jcc,k,0);
+                                Real z0 = Real(0.5) * (z_target_cc(icc,jcc,0) + z_target_cc(icc,jcc,1));
+                                Real f0 = src_target_cc(icc,jcc,0);
+                                if (z_state_cc <= z0) { return f0; }
+                                for (int kk = 0; kk < ksrc_max; ++kk) {
+                                    Real zl = Real(0.5) * (z_target_cc(icc,jcc,kk) + z_target_cc(icc,jcc,kk+1));
+                                    Real zh = Real(0.5) * (z_target_cc(icc,jcc,kk+1) + z_target_cc(icc,jcc,kk+2));
+                                    if (z_state_cc <= zh || kk == ksrc_max-1) {
+                                        Real fl = src_target_cc(icc,jcc,kk);
+                                        Real fh = src_target_cc(icc,jcc,kk+1);
+                                        Real dz = amrex::max(zh-zl, Real(1.e-12));
+                                        Real lam = (z_state_cc - zl) / dz;
+                                        lam = amrex::max(Real(0.0), amrex::min(Real(1.0), lam));
+                                        return (Real(1.0)-lam)*fl + lam*fh;
+                                    }
+                                }
+                                return src_target_cc(icc,jcc,ksrc_max);
+                            };
+                            auto state_cc = [&](int icc, int jcc) AMREX_GPU_DEVICE noexcept -> Real {
+                                if (ivar == ivarU) {
+                                    int i0 = amrex::min(amrex::max(icc,   dom_cc_lo.x), dom_cc_hi.x);
+                                    int i1 = amrex::min(amrex::max(icc+1, dom_cc_lo.x), dom_cc_hi.x+1);
+                                    int jc = amrex::min(amrex::max(jcc,   dom_cc_lo.y), dom_cc_hi.y);
+                                    return Real(0.5) * (state_arr(i0,jc,k,0) + state_arr(i1,jc,k,0));
+                                } else {
+                                    int ic = amrex::min(amrex::max(icc,   dom_cc_lo.x), dom_cc_hi.x);
+                                    int j0 = amrex::min(amrex::max(jcc,   dom_cc_lo.y), dom_cc_hi.y);
+                                    int j1 = amrex::min(amrex::max(jcc+1, dom_cc_lo.y), dom_cc_hi.y+1);
+                                    return Real(0.5) * (state_arr(ic,j0,k,0) + state_arr(ic,j1,k,0));
+                                }
+                            };
+                            auto rho_state_cc = [&](int icc, int jcc) AMREX_GPU_DEVICE noexcept -> Real {
+                                int kc = amrex::max(0, amrex::min(k, kmax_ph_xhi-1));
+                                Real mu_t = oma * bdatxhi_mu_n(icc,jcc,0,0) + alpha * bdatxhi_mu_np1(icc,jcc,0,0) + mub_arr(icc,jcc,0);
+                                Real xmu_mult_h = c1h_arr(0,0,kc) * mu_t + c2h_arr(0,0,kc);
+                                Real dpd = xmu_mult_h * amrex::Math::abs(dnw_arr(0,0,kc));
+                                Real phi_k   = oma * bdatxhi_ph_n(icc,jcc,kc,0)   + alpha * bdatxhi_ph_np1(icc,jcc,kc,0)   + phb_arr(icc,jcc,kc);
+                                Real phi_kp1 = oma * bdatxhi_ph_n(icc,jcc,kc+1,0) + alpha * bdatxhi_ph_np1(icc,jcc,kc+1,0) + phb_arr(icc,jcc,kc+1);
+                                Real dphi = amrex::max(phi_kp1 - phi_k, Real(1.0e-12));
+                                return dpd / dphi;
+                            };
+
+                            if (ivar == ivarU) {
+                                int iL = amrex::min(amrex::max(i-1, dom_cc_lo.x), dom_cc_hi.x);
+                                int iR = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                int jC = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                if (realbdy_vertical_remap_mode == 2) {
+                                    theta_t = Real(0.5) * (remap_target_cc(iL,jC) + remap_target_cc(iR,jC));
+                                } else if (realbdy_vertical_remap_mode == 3) {
+                                    Real deltaL = remap_target_cc(iL,jC) - state_cc(iL,jC);
+                                    Real deltaR = remap_target_cc(iR,jC) - state_cc(iR,jC);
+                                    Real delta_face = Real(0.5) * (deltaL + deltaR);
+                                    theta_t = state_arr(i,j,k,0) + delta_face;
+                                } else {
+                                    Real deltaL = remap_target_cc(iL,jC) - state_cc(iL,jC);
+                                    Real deltaR = remap_target_cc(iR,jC) - state_cc(iR,jC);
+                                    Real dconsL = rho_state_cc(iL,jC) * deltaL;
+                                    Real dconsR = rho_state_cc(iR,jC) * deltaR;
+                                    Real dcons_face = Real(0.5) * (dconsL + dconsR);
+                                    Real cons_target = state_cons_arr(i,j,k,0) + dcons_face;
+                                    Real rho_safe = (amrex::Math::abs(rho_interp) > Real(1.0e-12)) ? rho_interp : Real(1.0e-12);
+                                    theta_t = cons_target / rho_safe;
+                                }
+                            } else {
+                                int iC = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                int jL = amrex::min(amrex::max(j-1, dom_cc_lo.y), dom_cc_hi.y);
+                                int jR = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                if (realbdy_vertical_remap_mode == 2) {
+                                    theta_t = Real(0.5) * (remap_target_cc(iC,jL) + remap_target_cc(iC,jR));
+                                } else if (realbdy_vertical_remap_mode == 3) {
+                                    Real deltaL = remap_target_cc(iC,jL) - state_cc(iC,jL);
+                                    Real deltaR = remap_target_cc(iC,jR) - state_cc(iC,jR);
+                                    Real delta_face = Real(0.5) * (deltaL + deltaR);
+                                    theta_t = state_arr(i,j,k,0) + delta_face;
+                                } else {
+                                    Real deltaL = remap_target_cc(iC,jL) - state_cc(iC,jL);
+                                    Real deltaR = remap_target_cc(iC,jR) - state_cc(iC,jR);
+                                    Real dconsL = rho_state_cc(iC,jL) * deltaL;
+                                    Real dconsR = rho_state_cc(iC,jR) * deltaR;
+                                    Real dcons_face = Real(0.5) * (dconsL + dconsR);
+                                    Real cons_target = state_cons_arr(i,j,k,0) + dcons_face;
+                                    Real rho_safe = (amrex::Math::abs(rho_interp) > Real(1.0e-12)) ? rho_interp : Real(1.0e-12);
+                                    theta_t = cons_target / rho_safe;
+                                }
+                            }
+                        } else {
+                            // Path A-2: remap target profile directly at the state variable location.
+                            const Real z_state = z_tgt_loc(ivar, i, j, k);
+                            auto z_target = [&](int kk) AMREX_GPU_DEVICE noexcept -> Real {
+                                if (ivar == ivarU) {
+                                    int iL = amrex::min(amrex::max(i-1, dom_cc_lo.x), dom_cc_hi.x);
+                                    int iR = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                    int jC = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                    return Real(0.5) * (z_target_cc(iL,jC,kk) + z_target_cc(iR,jC,kk));
+                                } else if (ivar == ivarV) {
+                                    int iC = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                    int jL = amrex::min(amrex::max(j-1, dom_cc_lo.y), dom_cc_hi.y);
+                                    int jR = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                    return Real(0.5) * (z_target_cc(iC,jL,kk) + z_target_cc(iC,jR,kk));
+                                } else {
+                                    int iC = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                    int jC = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                    return z_target_cc(iC,jC,kk);
+                                }
+                            };
+                            if (ksrc_max > 0) {
+                                Real z0 = Real(0.5) * (z_target(0) + z_target(1));
+                                Real t0 = oma * bdatxhi_n(ii,jj,0,0) + alpha * bdatxhi_np1(ii,jj,0,0);
+                                if (z_state <= z0) {
+                                    theta_t = t0;
+                                } else {
+                                    bool found = false;
+                                    for (int kk = 0; kk < ksrc_max; ++kk) {
+                                        Real zl = Real(0.5) * (z_target(kk) + z_target(kk+1));
+                                        Real zh = Real(0.5) * (z_target(kk+1) + z_target(kk+2));
+                                        if (z_state <= zh || kk == ksrc_max-1) {
+                                            Real tl = oma * bdatxhi_n(ii,jj,kk,0) + alpha * bdatxhi_np1(ii,jj,kk,0);
+                                            Real th = oma * bdatxhi_n(ii,jj,kk+1,0) + alpha * bdatxhi_np1(ii,jj,kk+1,0);
+                                            Real dz = amrex::max(zh-zl, Real(1.e-12));
+                                            Real lam = (z_state - zl) / dz;
+                                            lam = amrex::max(Real(0.0), amrex::min(Real(1.0), lam));
+                                            theta_t = (Real(1.0)-lam)*tl + lam*th;
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!found) { theta_t = oma * bdatxhi_n(ii,jj,ksrc_max,0) + alpha * bdatxhi_np1(ii,jj,ksrc_max,0); }
+                                }
+                            }
+                        }
+                    }
+                    arr_xhi(i,j,k) = rho_interp * theta_t;
+                    if (do_dump_theta_for_var) {
+                        theta_dbg_arr(i,j,k,0) = theta_base;
+                        theta_dbg_arr(i,j,k,1) = theta_t;
+                        theta_dbg_arr(i,j,k,2) = theta_t - theta_base;
+                    }
                 }
             });
 
@@ -441,17 +1697,37 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
             [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept
             {
                 int ii = std::max(i , dom_lo.x);
-                    ii = std::min(ii, dom_hi.x);
+                    ii = std::min(ii, dom_hi.x + ((ivar==ivarU) ? 1 : 0));
                 int jj = std::max(j , dom_lo.y);
-                    jj = std::min(jj, dom_lo.y+offset);
+                    jj = std::min(jj, dom_lo.y + offset + ((ivar==ivarV) ? 1 : 0));
 
                 Real rho_interp;
-                if (ivar==ivarU) {
-                    rho_interp = myhalf * ( r_arr(i-1,j  ,k) + r_arr(i,j,k) );
-                } else if (ivar==ivarV) {
-                    rho_interp = myhalf * ( r_arr(i  ,j-1,k) + r_arr(i,j,k) );
+                if (!use_wrf_rho_interp) {
+                    if (ivar==ivarU) {
+                        rho_interp = myhalf * ( r_arr(i-1,j  ,k) + r_arr(i,j,k) );
+                    } else if (ivar==ivarV) {
+                        rho_interp = myhalf * ( r_arr(i  ,j-1,k) + r_arr(i,j,k) );
+                    } else {
+                        rho_interp = r_arr(i,j,k);
+                    }
                 } else {
-                    rho_interp = r_arr(i,j,k);
+                    auto rho_cc = [&] AMREX_GPU_DEVICE (int ic, int jc, int kc) noexcept -> Real {
+                        kc = amrex::max(0, amrex::min(kc, kmax_ph_ylo-1));
+                        Real mu_t = oma * bdatylo_mu_n(ic,jc,0,0) + alpha * bdatylo_mu_np1(ic,jc,0,0) + mub_arr(ic,jc,0);
+                        Real xmu_mult_h = c1h_arr(0,0,kc) * mu_t + c2h_arr(0,0,kc);
+                        Real dpd = xmu_mult_h * amrex::Math::abs(dnw_arr(0,0,kc));
+                        Real phi_k   = oma * bdatylo_ph_n(ic,jc,kc,0)   + alpha * bdatylo_ph_np1(ic,jc,kc,0)   + phb_arr(ic,jc,kc);
+                        Real phi_kp1 = oma * bdatylo_ph_n(ic,jc,kc+1,0) + alpha * bdatylo_ph_np1(ic,jc,kc+1,0) + phb_arr(ic,jc,kc+1);
+                        Real dphi = amrex::max(phi_kp1 - phi_k, Real(1.0e-12));
+                        return dpd / dphi;
+                    };
+                    if (ivar==ivarU) {
+                        rho_interp = myhalf * ( rho_cc(i-1,j,k) + rho_cc(i,j,k) );
+                    } else if (ivar==ivarV) {
+                        rho_interp = myhalf * ( rho_cc(i,j-1,k) + rho_cc(i,j,k) );
+                    } else {
+                        rho_interp = rho_cc(i,j,k);
+                    }
                 }
 
                 if (bdatylo) {
@@ -459,24 +1735,212 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
                     int jj2 = std::min(std::max(j , dom_cc_lo.y), dom_cc_hi.y);
                     arr_ylo(i,j,k) = rho_interp * bdatylo(ii2,jj2,k,bdy_comp);
                 } else {
-                    arr_ylo(i,j,k) = rho_interp * ( oma  * bdatylo_n  (ii,jj,k,0)
-                                                  + alpha * bdatylo_np1(ii,jj,k,0) );
+                    Real theta_base = oma * bdatylo_n(ii,jj,k,0) + alpha * bdatylo_np1(ii,jj,k,0);
+                    Real theta_t = theta_base;
+                    if (use_theta_vertical_remap) {
+                        const int ksrc_max = amrex::min(kmax_t_ylo, kmax_ph_ylo-1);
+                        auto z_target_cc = [&](int ic, int jc, int kk) AMREX_GPU_DEVICE noexcept -> Real {
+                            Real mu_t = oma * bdatylo_mu_n(ic,jc,0,0) + alpha * bdatylo_mu_np1(ic,jc,0,0) + mub_arr(ic,jc,0);
+                            Real xmu_f = c1f_arr(0,0,kk) * mu_t + c2f_arr(0,0,kk);
+                            Real ph_t = oma * bdatylo_ph_n(ic,jc,kk,0) + alpha * bdatylo_ph_np1(ic,jc,kk,0);
+                            return (ph_t / xmu_f + phb_arr(ic,jc,kk)) / CONST_GRAV;
+                        };
+
+                        if ((realbdy_vertical_remap_mode == 2 ||
+                             realbdy_vertical_remap_mode == 3 ||
+                             realbdy_vertical_remap_mode == 4) &&
+                            (ivar == ivarU || ivar == ivarV) && ksrc_max > 0) {
+                            auto src_target_cc = [&](int icc, int jcc, int kk) AMREX_GPU_DEVICE noexcept -> Real {
+                                if (ivar == ivarU) {
+                                    int i0 = amrex::min(amrex::max(icc,   dom_lo.x), dom_hi.x);
+                                    int i1 = amrex::min(amrex::max(icc+1, dom_lo.x), dom_hi.x);
+                                    int jc = amrex::min(amrex::max(jcc,   dom_lo.y), dom_hi.y);
+                                    Real u0 = oma * bdatylo_n(i0,jc,kk,0) + alpha * bdatylo_np1(i0,jc,kk,0);
+                                    Real u1 = oma * bdatylo_n(i1,jc,kk,0) + alpha * bdatylo_np1(i1,jc,kk,0);
+                                    return Real(0.5) * (u0 + u1);
+                                } else {
+                                    int ic = amrex::min(amrex::max(icc,   dom_lo.x), dom_hi.x);
+                                    int j0 = amrex::min(amrex::max(jcc,   dom_lo.y), dom_hi.y);
+                                    int j1 = amrex::min(amrex::max(jcc+1, dom_lo.y), dom_hi.y);
+                                    Real v0 = oma * bdatylo_n(ic,j0,kk,0) + alpha * bdatylo_np1(ic,j0,kk,0);
+                                    Real v1 = oma * bdatylo_n(ic,j1,kk,0) + alpha * bdatylo_np1(ic,j1,kk,0);
+                                    return Real(0.5) * (v0 + v1);
+                                }
+                            };
+                            auto remap_target_cc = [&](int icc, int jcc) AMREX_GPU_DEVICE noexcept -> Real {
+                                const Real z_state_cc = zcc_arr(icc,jcc,k,0);
+                                Real z0 = Real(0.5) * (z_target_cc(icc,jcc,0) + z_target_cc(icc,jcc,1));
+                                Real f0 = src_target_cc(icc,jcc,0);
+                                if (z_state_cc <= z0) { return f0; }
+                                for (int kk = 0; kk < ksrc_max; ++kk) {
+                                    Real zl = Real(0.5) * (z_target_cc(icc,jcc,kk) + z_target_cc(icc,jcc,kk+1));
+                                    Real zh = Real(0.5) * (z_target_cc(icc,jcc,kk+1) + z_target_cc(icc,jcc,kk+2));
+                                    if (z_state_cc <= zh || kk == ksrc_max-1) {
+                                        Real fl = src_target_cc(icc,jcc,kk);
+                                        Real fh = src_target_cc(icc,jcc,kk+1);
+                                        Real dz = amrex::max(zh-zl, Real(1.e-12));
+                                        Real lam = (z_state_cc - zl) / dz;
+                                        lam = amrex::max(Real(0.0), amrex::min(Real(1.0), lam));
+                                        return (Real(1.0)-lam)*fl + lam*fh;
+                                    }
+                                }
+                                return src_target_cc(icc,jcc,ksrc_max);
+                            };
+                            auto state_cc = [&](int icc, int jcc) AMREX_GPU_DEVICE noexcept -> Real {
+                                if (ivar == ivarU) {
+                                    int i0 = amrex::min(amrex::max(icc,   dom_cc_lo.x), dom_cc_hi.x);
+                                    int i1 = amrex::min(amrex::max(icc+1, dom_cc_lo.x), dom_cc_hi.x+1);
+                                    int jc = amrex::min(amrex::max(jcc,   dom_cc_lo.y), dom_cc_hi.y);
+                                    return Real(0.5) * (state_arr(i0,jc,k,0) + state_arr(i1,jc,k,0));
+                                } else {
+                                    int ic = amrex::min(amrex::max(icc,   dom_cc_lo.x), dom_cc_hi.x);
+                                    int j0 = amrex::min(amrex::max(jcc,   dom_cc_lo.y), dom_cc_hi.y);
+                                    int j1 = amrex::min(amrex::max(jcc+1, dom_cc_lo.y), dom_cc_hi.y+1);
+                                    return Real(0.5) * (state_arr(ic,j0,k,0) + state_arr(ic,j1,k,0));
+                                }
+                            };
+                            auto rho_state_cc = [&](int icc, int jcc) AMREX_GPU_DEVICE noexcept -> Real {
+                                int kc = amrex::max(0, amrex::min(k, kmax_ph_ylo-1));
+                                Real mu_t = oma * bdatylo_mu_n(icc,jcc,0,0) + alpha * bdatylo_mu_np1(icc,jcc,0,0) + mub_arr(icc,jcc,0);
+                                Real xmu_mult_h = c1h_arr(0,0,kc) * mu_t + c2h_arr(0,0,kc);
+                                Real dpd = xmu_mult_h * amrex::Math::abs(dnw_arr(0,0,kc));
+                                Real phi_k   = oma * bdatylo_ph_n(icc,jcc,kc,0)   + alpha * bdatylo_ph_np1(icc,jcc,kc,0)   + phb_arr(icc,jcc,kc);
+                                Real phi_kp1 = oma * bdatylo_ph_n(icc,jcc,kc+1,0) + alpha * bdatylo_ph_np1(icc,jcc,kc+1,0) + phb_arr(icc,jcc,kc+1);
+                                Real dphi = amrex::max(phi_kp1 - phi_k, Real(1.0e-12));
+                                return dpd / dphi;
+                            };
+
+                            if (ivar == ivarU) {
+                                int iL = amrex::min(amrex::max(i-1, dom_cc_lo.x), dom_cc_hi.x);
+                                int iR = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                int jC = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                if (realbdy_vertical_remap_mode == 2) {
+                                    theta_t = Real(0.5) * (remap_target_cc(iL,jC) + remap_target_cc(iR,jC));
+                                } else if (realbdy_vertical_remap_mode == 3) {
+                                    Real deltaL = remap_target_cc(iL,jC) - state_cc(iL,jC);
+                                    Real deltaR = remap_target_cc(iR,jC) - state_cc(iR,jC);
+                                    Real delta_face = Real(0.5) * (deltaL + deltaR);
+                                    theta_t = state_arr(i,j,k,0) + delta_face;
+                                } else {
+                                    Real deltaL = remap_target_cc(iL,jC) - state_cc(iL,jC);
+                                    Real deltaR = remap_target_cc(iR,jC) - state_cc(iR,jC);
+                                    Real dconsL = rho_state_cc(iL,jC) * deltaL;
+                                    Real dconsR = rho_state_cc(iR,jC) * deltaR;
+                                    Real dcons_face = Real(0.5) * (dconsL + dconsR);
+                                    Real cons_target = state_cons_arr(i,j,k,0) + dcons_face;
+                                    Real rho_safe = (amrex::Math::abs(rho_interp) > Real(1.0e-12)) ? rho_interp : Real(1.0e-12);
+                                    theta_t = cons_target / rho_safe;
+                                }
+                            } else {
+                                int iC = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                int jL = amrex::min(amrex::max(j-1, dom_cc_lo.y), dom_cc_hi.y);
+                                int jR = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                if (realbdy_vertical_remap_mode == 2) {
+                                    theta_t = Real(0.5) * (remap_target_cc(iC,jL) + remap_target_cc(iC,jR));
+                                } else if (realbdy_vertical_remap_mode == 3) {
+                                    Real deltaL = remap_target_cc(iC,jL) - state_cc(iC,jL);
+                                    Real deltaR = remap_target_cc(iC,jR) - state_cc(iC,jR);
+                                    Real delta_face = Real(0.5) * (deltaL + deltaR);
+                                    theta_t = state_arr(i,j,k,0) + delta_face;
+                                } else {
+                                    Real deltaL = remap_target_cc(iC,jL) - state_cc(iC,jL);
+                                    Real deltaR = remap_target_cc(iC,jR) - state_cc(iC,jR);
+                                    Real dconsL = rho_state_cc(iC,jL) * deltaL;
+                                    Real dconsR = rho_state_cc(iC,jR) * deltaR;
+                                    Real dcons_face = Real(0.5) * (dconsL + dconsR);
+                                    Real cons_target = state_cons_arr(i,j,k,0) + dcons_face;
+                                    Real rho_safe = (amrex::Math::abs(rho_interp) > Real(1.0e-12)) ? rho_interp : Real(1.0e-12);
+                                    theta_t = cons_target / rho_safe;
+                                }
+                            }
+                        } else {
+                            // Path A-2: remap target profile directly at the state variable location.
+                            const Real z_state = z_tgt_loc(ivar, i, j, k);
+                            auto z_target = [&](int kk) AMREX_GPU_DEVICE noexcept -> Real {
+                                if (ivar == ivarU) {
+                                    int iL = amrex::min(amrex::max(i-1, dom_cc_lo.x), dom_cc_hi.x);
+                                    int iR = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                    int jC = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                    return Real(0.5) * (z_target_cc(iL,jC,kk) + z_target_cc(iR,jC,kk));
+                                } else if (ivar == ivarV) {
+                                    int iC = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                    int jL = amrex::min(amrex::max(j-1, dom_cc_lo.y), dom_cc_hi.y);
+                                    int jR = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                    return Real(0.5) * (z_target_cc(iC,jL,kk) + z_target_cc(iC,jR,kk));
+                                } else {
+                                    int iC = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                    int jC = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                    return z_target_cc(iC,jC,kk);
+                                }
+                            };
+                            if (ksrc_max > 0) {
+                                Real z0 = Real(0.5) * (z_target(0) + z_target(1));
+                                Real t0 = oma * bdatylo_n(ii,jj,0,0) + alpha * bdatylo_np1(ii,jj,0,0);
+                                if (z_state <= z0) {
+                                    theta_t = t0;
+                                } else {
+                                    bool found = false;
+                                    for (int kk = 0; kk < ksrc_max; ++kk) {
+                                        Real zl = Real(0.5) * (z_target(kk) + z_target(kk+1));
+                                        Real zh = Real(0.5) * (z_target(kk+1) + z_target(kk+2));
+                                        if (z_state <= zh || kk == ksrc_max-1) {
+                                            Real tl = oma * bdatylo_n(ii,jj,kk,0) + alpha * bdatylo_np1(ii,jj,kk,0);
+                                            Real th = oma * bdatylo_n(ii,jj,kk+1,0) + alpha * bdatylo_np1(ii,jj,kk+1,0);
+                                            Real dz = amrex::max(zh-zl, Real(1.e-12));
+                                            Real lam = (z_state - zl) / dz;
+                                            lam = amrex::max(Real(0.0), amrex::min(Real(1.0), lam));
+                                            theta_t = (Real(1.0)-lam)*tl + lam*th;
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!found) { theta_t = oma * bdatylo_n(ii,jj,ksrc_max,0) + alpha * bdatylo_np1(ii,jj,ksrc_max,0); }
+                                }
+                            }
+                        }
+                    }
+                    arr_ylo(i,j,k) = rho_interp * theta_t;
+                    if (do_dump_theta_for_var) {
+                        theta_dbg_arr(i,j,k,0) = theta_base;
+                        theta_dbg_arr(i,j,k,1) = theta_t;
+                        theta_dbg_arr(i,j,k,2) = theta_t - theta_base;
+                    }
                 }
             },
             [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept
             {
                 int ii = std::max(i , dom_lo.x);
-                    ii = std::min(ii, dom_hi.x);
-                int jj = std::max(j , dom_hi.y-offset);
-                    jj = std::min(jj, dom_hi.y);
+                    ii = std::min(ii, dom_hi.x + ((ivar==ivarU) ? 1 : 0));
+                int jj = std::max(j , dom_hi.y - offset + ((ivar==ivarV) ? 1 : 0));
+                    jj = std::min(jj, dom_hi.y + ((ivar==ivarV) ? 1 : 0));
 
                 Real rho_interp;
-                if (ivar==ivarU) {
-                    rho_interp = myhalf * ( r_arr(i-1,j  ,k) + r_arr(i,j,k) );
-                } else if (ivar==ivarV) {
-                    rho_interp = myhalf * ( r_arr(i  ,j-1,k) + r_arr(i,j,k) );
+                if (!use_wrf_rho_interp) {
+                    if (ivar==ivarU) {
+                        rho_interp = myhalf * ( r_arr(i-1,j  ,k) + r_arr(i,j,k) );
+                    } else if (ivar==ivarV) {
+                        rho_interp = myhalf * ( r_arr(i  ,j-1,k) + r_arr(i,j,k) );
+                    } else {
+                        rho_interp = r_arr(i,j,k);
+                    }
                 } else {
-                    rho_interp = r_arr(i,j,k);
+                    auto rho_cc = [&] AMREX_GPU_DEVICE (int ic, int jc, int kc) noexcept -> Real {
+                        kc = amrex::max(0, amrex::min(kc, kmax_ph_yhi-1));
+                        Real mu_t = oma * bdatyhi_mu_n(ic,jc,0,0) + alpha * bdatyhi_mu_np1(ic,jc,0,0) + mub_arr(ic,jc,0);
+                        Real xmu_mult_h = c1h_arr(0,0,kc) * mu_t + c2h_arr(0,0,kc);
+                        Real dpd = xmu_mult_h * amrex::Math::abs(dnw_arr(0,0,kc));
+                        Real phi_k   = oma * bdatyhi_ph_n(ic,jc,kc,0)   + alpha * bdatyhi_ph_np1(ic,jc,kc,0)   + phb_arr(ic,jc,kc);
+                        Real phi_kp1 = oma * bdatyhi_ph_n(ic,jc,kc+1,0) + alpha * bdatyhi_ph_np1(ic,jc,kc+1,0) + phb_arr(ic,jc,kc+1);
+                        Real dphi = amrex::max(phi_kp1 - phi_k, Real(1.0e-12));
+                        return dpd / dphi;
+                    };
+                    if (ivar==ivarU) {
+                        rho_interp = myhalf * ( rho_cc(i-1,j,k) + rho_cc(i,j,k) );
+                    } else if (ivar==ivarV) {
+                        rho_interp = myhalf * ( rho_cc(i,j-1,k) + rho_cc(i,j,k) );
+                    } else {
+                        rho_interp = rho_cc(i,j,k);
+                    }
                 }
 
                 if (bdatyhi) {
@@ -484,11 +1948,234 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
                     int jj2 = std::min(std::max(j , dom_cc_lo.y), dom_cc_hi.y);
                     arr_yhi(i,j,k) = rho_interp * bdatyhi(ii2,jj2,k,bdy_comp);
                 } else {
-                    arr_yhi(i,j,k) = rho_interp * ( oma   * bdatyhi_n  (ii,jj,k,0)
-                                                  + alpha * bdatyhi_np1(ii,jj,k,0) );
+                    Real theta_base = oma * bdatyhi_n(ii,jj,k,0) + alpha * bdatyhi_np1(ii,jj,k,0);
+                    Real theta_t = theta_base;
+                    if (use_theta_vertical_remap) {
+                        const int ksrc_max = amrex::min(kmax_t_yhi, kmax_ph_yhi-1);
+                        auto z_target_cc = [&](int ic, int jc, int kk) AMREX_GPU_DEVICE noexcept -> Real {
+                            Real mu_t = oma * bdatyhi_mu_n(ic,jc,0,0) + alpha * bdatyhi_mu_np1(ic,jc,0,0) + mub_arr(ic,jc,0);
+                            Real xmu_f = c1f_arr(0,0,kk) * mu_t + c2f_arr(0,0,kk);
+                            Real ph_t = oma * bdatyhi_ph_n(ic,jc,kk,0) + alpha * bdatyhi_ph_np1(ic,jc,kk,0);
+                            return (ph_t / xmu_f + phb_arr(ic,jc,kk)) / CONST_GRAV;
+                        };
+
+                        if ((realbdy_vertical_remap_mode == 2 ||
+                             realbdy_vertical_remap_mode == 3 ||
+                             realbdy_vertical_remap_mode == 4) &&
+                            (ivar == ivarU || ivar == ivarV) && ksrc_max > 0) {
+                            auto src_target_cc = [&](int icc, int jcc, int kk) AMREX_GPU_DEVICE noexcept -> Real {
+                                if (ivar == ivarU) {
+                                    int i0 = amrex::min(amrex::max(icc,   dom_lo.x), dom_hi.x);
+                                    int i1 = amrex::min(amrex::max(icc+1, dom_lo.x), dom_hi.x);
+                                    int jc = amrex::min(amrex::max(jcc,   dom_lo.y), dom_hi.y);
+                                    Real u0 = oma * bdatyhi_n(i0,jc,kk,0) + alpha * bdatyhi_np1(i0,jc,kk,0);
+                                    Real u1 = oma * bdatyhi_n(i1,jc,kk,0) + alpha * bdatyhi_np1(i1,jc,kk,0);
+                                    return Real(0.5) * (u0 + u1);
+                                } else {
+                                    int ic = amrex::min(amrex::max(icc,   dom_lo.x), dom_hi.x);
+                                    int j0 = amrex::min(amrex::max(jcc,   dom_lo.y), dom_hi.y);
+                                    int j1 = amrex::min(amrex::max(jcc+1, dom_lo.y), dom_hi.y);
+                                    Real v0 = oma * bdatyhi_n(ic,j0,kk,0) + alpha * bdatyhi_np1(ic,j0,kk,0);
+                                    Real v1 = oma * bdatyhi_n(ic,j1,kk,0) + alpha * bdatyhi_np1(ic,j1,kk,0);
+                                    return Real(0.5) * (v0 + v1);
+                                }
+                            };
+                            auto remap_target_cc = [&](int icc, int jcc) AMREX_GPU_DEVICE noexcept -> Real {
+                                const Real z_state_cc = zcc_arr(icc,jcc,k,0);
+                                Real z0 = Real(0.5) * (z_target_cc(icc,jcc,0) + z_target_cc(icc,jcc,1));
+                                Real f0 = src_target_cc(icc,jcc,0);
+                                if (z_state_cc <= z0) { return f0; }
+                                for (int kk = 0; kk < ksrc_max; ++kk) {
+                                    Real zl = Real(0.5) * (z_target_cc(icc,jcc,kk) + z_target_cc(icc,jcc,kk+1));
+                                    Real zh = Real(0.5) * (z_target_cc(icc,jcc,kk+1) + z_target_cc(icc,jcc,kk+2));
+                                    if (z_state_cc <= zh || kk == ksrc_max-1) {
+                                        Real fl = src_target_cc(icc,jcc,kk);
+                                        Real fh = src_target_cc(icc,jcc,kk+1);
+                                        Real dz = amrex::max(zh-zl, Real(1.e-12));
+                                        Real lam = (z_state_cc - zl) / dz;
+                                        lam = amrex::max(Real(0.0), amrex::min(Real(1.0), lam));
+                                        return (Real(1.0)-lam)*fl + lam*fh;
+                                    }
+                                }
+                                return src_target_cc(icc,jcc,ksrc_max);
+                            };
+                            auto state_cc = [&](int icc, int jcc) AMREX_GPU_DEVICE noexcept -> Real {
+                                if (ivar == ivarU) {
+                                    int i0 = amrex::min(amrex::max(icc,   dom_cc_lo.x), dom_cc_hi.x);
+                                    int i1 = amrex::min(amrex::max(icc+1, dom_cc_lo.x), dom_cc_hi.x+1);
+                                    int jc = amrex::min(amrex::max(jcc,   dom_cc_lo.y), dom_cc_hi.y);
+                                    return Real(0.5) * (state_arr(i0,jc,k,0) + state_arr(i1,jc,k,0));
+                                } else {
+                                    int ic = amrex::min(amrex::max(icc,   dom_cc_lo.x), dom_cc_hi.x);
+                                    int j0 = amrex::min(amrex::max(jcc,   dom_cc_lo.y), dom_cc_hi.y);
+                                    int j1 = amrex::min(amrex::max(jcc+1, dom_cc_lo.y), dom_cc_hi.y+1);
+                                    return Real(0.5) * (state_arr(ic,j0,k,0) + state_arr(ic,j1,k,0));
+                                }
+                            };
+                            auto rho_state_cc = [&](int icc, int jcc) AMREX_GPU_DEVICE noexcept -> Real {
+                                int kc = amrex::max(0, amrex::min(k, kmax_ph_yhi-1));
+                                Real mu_t = oma * bdatyhi_mu_n(icc,jcc,0,0) + alpha * bdatyhi_mu_np1(icc,jcc,0,0) + mub_arr(icc,jcc,0);
+                                Real xmu_mult_h = c1h_arr(0,0,kc) * mu_t + c2h_arr(0,0,kc);
+                                Real dpd = xmu_mult_h * amrex::Math::abs(dnw_arr(0,0,kc));
+                                Real phi_k   = oma * bdatyhi_ph_n(icc,jcc,kc,0)   + alpha * bdatyhi_ph_np1(icc,jcc,kc,0)   + phb_arr(icc,jcc,kc);
+                                Real phi_kp1 = oma * bdatyhi_ph_n(icc,jcc,kc+1,0) + alpha * bdatyhi_ph_np1(icc,jcc,kc+1,0) + phb_arr(icc,jcc,kc+1);
+                                Real dphi = amrex::max(phi_kp1 - phi_k, Real(1.0e-12));
+                                return dpd / dphi;
+                            };
+
+                            if (ivar == ivarU) {
+                                int iL = amrex::min(amrex::max(i-1, dom_cc_lo.x), dom_cc_hi.x);
+                                int iR = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                int jC = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                if (realbdy_vertical_remap_mode == 2) {
+                                    theta_t = Real(0.5) * (remap_target_cc(iL,jC) + remap_target_cc(iR,jC));
+                                } else if (realbdy_vertical_remap_mode == 3) {
+                                    Real deltaL = remap_target_cc(iL,jC) - state_cc(iL,jC);
+                                    Real deltaR = remap_target_cc(iR,jC) - state_cc(iR,jC);
+                                    Real delta_face = Real(0.5) * (deltaL + deltaR);
+                                    theta_t = state_arr(i,j,k,0) + delta_face;
+                                } else {
+                                    Real deltaL = remap_target_cc(iL,jC) - state_cc(iL,jC);
+                                    Real deltaR = remap_target_cc(iR,jC) - state_cc(iR,jC);
+                                    Real dconsL = rho_state_cc(iL,jC) * deltaL;
+                                    Real dconsR = rho_state_cc(iR,jC) * deltaR;
+                                    Real dcons_face = Real(0.5) * (dconsL + dconsR);
+                                    Real cons_target = state_cons_arr(i,j,k,0) + dcons_face;
+                                    Real rho_safe = (amrex::Math::abs(rho_interp) > Real(1.0e-12)) ? rho_interp : Real(1.0e-12);
+                                    theta_t = cons_target / rho_safe;
+                                }
+                            } else {
+                                int iC = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                int jL = amrex::min(amrex::max(j-1, dom_cc_lo.y), dom_cc_hi.y);
+                                int jR = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                if (realbdy_vertical_remap_mode == 2) {
+                                    theta_t = Real(0.5) * (remap_target_cc(iC,jL) + remap_target_cc(iC,jR));
+                                } else if (realbdy_vertical_remap_mode == 3) {
+                                    Real deltaL = remap_target_cc(iC,jL) - state_cc(iC,jL);
+                                    Real deltaR = remap_target_cc(iC,jR) - state_cc(iC,jR);
+                                    Real delta_face = Real(0.5) * (deltaL + deltaR);
+                                    theta_t = state_arr(i,j,k,0) + delta_face;
+                                } else {
+                                    Real deltaL = remap_target_cc(iC,jL) - state_cc(iC,jL);
+                                    Real deltaR = remap_target_cc(iC,jR) - state_cc(iC,jR);
+                                    Real dconsL = rho_state_cc(iC,jL) * deltaL;
+                                    Real dconsR = rho_state_cc(iC,jR) * deltaR;
+                                    Real dcons_face = Real(0.5) * (dconsL + dconsR);
+                                    Real cons_target = state_cons_arr(i,j,k,0) + dcons_face;
+                                    Real rho_safe = (amrex::Math::abs(rho_interp) > Real(1.0e-12)) ? rho_interp : Real(1.0e-12);
+                                    theta_t = cons_target / rho_safe;
+                                }
+                            }
+                        } else {
+                            // Path A-2: remap target profile directly at the state variable location.
+                            const Real z_state = z_tgt_loc(ivar, i, j, k);
+                            auto z_target = [&](int kk) AMREX_GPU_DEVICE noexcept -> Real {
+                                if (ivar == ivarU) {
+                                    int iL = amrex::min(amrex::max(i-1, dom_cc_lo.x), dom_cc_hi.x);
+                                    int iR = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                    int jC = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                    return Real(0.5) * (z_target_cc(iL,jC,kk) + z_target_cc(iR,jC,kk));
+                                } else if (ivar == ivarV) {
+                                    int iC = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                    int jL = amrex::min(amrex::max(j-1, dom_cc_lo.y), dom_cc_hi.y);
+                                    int jR = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                    return Real(0.5) * (z_target_cc(iC,jL,kk) + z_target_cc(iC,jR,kk));
+                                } else {
+                                    int iC = amrex::min(amrex::max(i  , dom_cc_lo.x), dom_cc_hi.x);
+                                    int jC = amrex::min(amrex::max(j  , dom_cc_lo.y), dom_cc_hi.y);
+                                    return z_target_cc(iC,jC,kk);
+                                }
+                            };
+                            if (ksrc_max > 0) {
+                                Real z0 = Real(0.5) * (z_target(0) + z_target(1));
+                                Real t0 = oma * bdatyhi_n(ii,jj,0,0) + alpha * bdatyhi_np1(ii,jj,0,0);
+                                if (z_state <= z0) {
+                                    theta_t = t0;
+                                } else {
+                                    bool found = false;
+                                    for (int kk = 0; kk < ksrc_max; ++kk) {
+                                        Real zl = Real(0.5) * (z_target(kk) + z_target(kk+1));
+                                        Real zh = Real(0.5) * (z_target(kk+1) + z_target(kk+2));
+                                        if (z_state <= zh || kk == ksrc_max-1) {
+                                            Real tl = oma * bdatyhi_n(ii,jj,kk,0) + alpha * bdatyhi_np1(ii,jj,kk,0);
+                                            Real th = oma * bdatyhi_n(ii,jj,kk+1,0) + alpha * bdatyhi_np1(ii,jj,kk+1,0);
+                                            Real dz = amrex::max(zh-zl, Real(1.e-12));
+                                            Real lam = (z_state - zl) / dz;
+                                            lam = amrex::max(Real(0.0), amrex::min(Real(1.0), lam));
+                                            theta_t = (Real(1.0)-lam)*tl + lam*th;
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!found) { theta_t = oma * bdatyhi_n(ii,jj,ksrc_max,0) + alpha * bdatyhi_np1(ii,jj,ksrc_max,0); }
+                                }
+                            }
+                        }
+                    }
+                    arr_yhi(i,j,k) = rho_interp * theta_t;
+                    if (do_dump_theta_for_var) {
+                        theta_dbg_arr(i,j,k,0) = theta_base;
+                        theta_dbg_arr(i,j,k,1) = theta_t;
+                        theta_dbg_arr(i,j,k,2) = theta_t - theta_base;
+                    }
                 }
             });
+
+#ifndef AMREX_USE_GPU
+            if (dbg_realbdy_rho_pathB_diag && ivar == ivarT && have_wrfbdy_ph && ParallelDescriptor::IOProcessor()) {
+                int ic = std::min(std::max(domain.smallEnd(0), domain.smallEnd(0)+width/2), domain.bigEnd(0));
+                int jc = (domain.smallEnd(1) + domain.bigEnd(1)) / 2;
+                int k0 = 0;
+                int km = domain.bigEnd(2) / 2;
+                int kt = domain.bigEnd(2);
+                auto rho_wrf_cc = [&](int i, int j, int k) {
+                    int kph = std::max(0, std::min(k, bdy_data_xlo[n_time][WRFBdyVars::PH].box().bigEnd(2)-1));
+                    Real mu_t = oma * bdatxlo_mu_n(i,j,0,0) + alpha * bdatxlo_mu_np1(i,j,0,0) + mub_arr(i,j,0);
+                    Real xmu_mult_h = c1h_arr(0,0,kph) * mu_t + c2h_arr(0,0,kph);
+                    Real dpd = xmu_mult_h * std::abs(dnw_arr(0,0,kph));
+                    Real phi_k   = oma * bdatxlo_ph_n(i,j,kph,0)   + alpha * bdatxlo_ph_np1(i,j,kph,0)   + phb_arr(i,j,kph);
+                    Real phi_kp1 = oma * bdatxlo_ph_n(i,j,kph+1,0) + alpha * bdatxlo_ph_np1(i,j,kph+1,0) + phb_arr(i,j,kph+1);
+                    Real dphi = std::max(phi_kp1 - phi_k, Real(1.0e-12));
+                    return dpd / dphi;
+                };
+                auto dpd_dphi = [&](int i, int j, int k) {
+                    int kph = std::max(0, std::min(k, bdy_data_xlo[n_time][WRFBdyVars::PH].box().bigEnd(2)-1));
+                    Real mu_t = oma * bdatxlo_mu_n(i,j,0,0) + alpha * bdatxlo_mu_np1(i,j,0,0) + mub_arr(i,j,0);
+                    Real xmu_mult_h = c1h_arr(0,0,kph) * mu_t + c2h_arr(0,0,kph);
+                    Real dpd = xmu_mult_h * std::abs(dnw_arr(0,0,kph));
+                    Real phi_k   = oma * bdatxlo_ph_n(i,j,kph,0)   + alpha * bdatxlo_ph_np1(i,j,kph,0)   + phb_arr(i,j,kph);
+                    Real phi_kp1 = oma * bdatxlo_ph_n(i,j,kph+1,0) + alpha * bdatxlo_ph_np1(i,j,kph+1,0) + phb_arr(i,j,kph+1);
+                    Real dphi = phi_kp1 - phi_k;
+                    return std::array<Real,3>{dpd,dphi,xmu_mult_h};
+                };
+                auto a0 = dpd_dphi(ic,jc,k0);
+                auto am = dpd_dphi(ic,jc,km);
+                auto at = dpd_dphi(ic,jc,kt);
+                Print() << "[DBG_RHO_PATHB sample xlo]"
+                        << " i=" << ic << " j=" << jc
+                        << " k0 wrf=" << rho_wrf_cc(ic,jc,k0) << " erf=" << r_arr(ic,jc,k0)
+                        << " dpd=" << a0[0] << " dphi=" << a0[1] << " xmuH=" << a0[2]
+                        << " km wrf=" << rho_wrf_cc(ic,jc,km) << " erf=" << r_arr(ic,jc,km)
+                        << " dpd=" << am[0] << " dphi=" << am[1] << " xmuH=" << am[2]
+                        << " kt wrf=" << rho_wrf_cc(ic,jc,kt) << " erf=" << r_arr(ic,jc,kt)
+                        << " dpd=" << at[0] << " dphi=" << at[1] << " xmuH=" << at[2]
+                        << std::endl;
+            }
+#endif
         } // mfi
+
+        if (do_dump_theta_for_var) {
+            std::string var_label = "theta";
+            if (ivar == ivarU) var_label = "u";
+            if (ivar == ivarV) var_label = "v";
+            const std::string pf_name =
+                amrex::Concatenate(dbg_realbdy_dump_theta_prefix + "_" + var_label + "_", dbg_realbdy_dump_theta_counter, 6);
+            Vector<std::string> varnames{"prim_bdy","remap_bdy","remap_minus_prim"};
+            WriteSingleLevelPlotfile(pf_name, mf_theta_dbg, varnames, geom, time, dbg_realbdy_dump_theta_counter);
+            if (ParallelDescriptor::IOProcessor()) {
+                Print() << "[DBG_REALBDY_THETA_DUMP] wrote " << pf_name << "\n";
+            }
+        }
     } // ivar
 
 
@@ -1023,11 +2710,9 @@ realbdy_compute_interior_ghost_rhs (const Real& time,
                                        tbx_xlo , tbx_xhi , tbx_ylo , tbx_yhi ,
                                        arr_xlo , arr_xhi , arr_ylo , arr_yhi ,
                                        u_xlo, u_xhi, v_xlo, v_xhi, v_ylo, v_yhi,
-                                       rho_cc_arr,
                                        data_arr, rhs_arr, nudge_scale, dbg_nudge_x, dbg_nudge_y,
                                        dbg_nudge_exclude_x_corners, dbg_nudge_const_factor, do_upwind,
                                        y_face_owns_corners, dbg_realbdy_yface_corner_use_max_metric,
-                                       dbg_realbdy_use_primitive_delta,
                                        dbg_realbdy_weight_profile_id, dbg_realbdy_weight_tanh_beta);
 
             /*

@@ -117,10 +117,12 @@ namespace WRFBdyVars {
     enum {
         U  = 0,
         V  = 1,
-        T  = 2,
-        QV = 3, // water vapor
-        MU    , // bdy perturbation dry air mass in column (we will get mub from the initial data)
-        PC    , // p_s - p_top = dry hydrostatic pressure difference between the surface and the model top
+        T  = 2, // half levels, cell centered
+        QV = 3, // water vapor, half levels, cell centered
+        MU    , // bdy perturbation dry air mass in column (we will get mub from the initial data), 2D
+        PC    , // p_s - p_top = dry hydrostatic pressure difference between the surface and the model top, 2D
+        W     , // full (w) levels, z-face centered
+        PH    , // perturbation geopotential, full (w) levels, z-face centered
         NumTypes
     };
 }

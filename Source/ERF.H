@@ -554,6 +554,9 @@ public:
     void init_from_wrfinput (int lev,
                              amrex::MultiFab& mf_C1H,
                              amrex::MultiFab& mf_C2H,
+                             amrex::MultiFab& mf_C1F,
+                             amrex::MultiFab& mf_C2F,
+                             amrex::MultiFab& mf_DNW,
                              amrex::MultiFab& mf_MUB,
                              amrex::MultiFab& mf_PSFC);
     void init_from_metgrid  (int lev);
@@ -1268,7 +1271,14 @@ private:
     amrex::Vector<amrex::BoxArray> ba2d;
     std::unique_ptr<amrex::MultiFab> mf_C1H;
     std::unique_ptr<amrex::MultiFab> mf_C2H;
+    std::unique_ptr<amrex::MultiFab> mf_C1F;
+    std::unique_ptr<amrex::MultiFab> mf_C2F;
+    std::unique_ptr<amrex::MultiFab> mf_DNW;
     std::unique_ptr<amrex::MultiFab> mf_MUB;
+    std::unique_ptr<amrex::MultiFab> mf_PH_wrfin;
+    std::unique_ptr<amrex::MultiFab> mf_PHB_wrfin;
+    std::unique_ptr<amrex::MultiFab> mf_HGT_wrfin;
+    amrex::Real wrf_p_top = amrex::Real(0.0);
 
     amrex::Vector<std::unique_ptr<amrex::MultiFab>> mf_PSFC;
 

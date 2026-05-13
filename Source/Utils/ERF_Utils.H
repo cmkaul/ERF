@@ -6,6 +6,7 @@
 #include "AMReX_BCRec.H"
 #include "ERF_DataStruct.H"
 #include "ERF_IndexDefines.H"
+#include "ERF_VertInterp.H"
 #include "ERF_SurfaceLayer.H"
 #include "ERF_FillPatcher.H"
 #include "ERF_ReadBndryPlanes.H"
@@ -121,10 +122,21 @@ void realbdy_compute_interior_ghost_rhs (const amrex::Real& total_time,
                                          const amrex::Geometry& geom,
                                          amrex::Vector<amrex::MultiFab>& S_rhs,
                                          amrex::Vector<amrex::MultiFab>& S_cur_data,
-                                         amrex::Vector<amrex::Vector<amrex::FArrayBox>>& bdy_data_xlo,
-                                         amrex::Vector<amrex::Vector<amrex::FArrayBox>>& bdy_data_xhi,
-                                         amrex::Vector<amrex::Vector<amrex::FArrayBox>>& bdy_data_ylo,
-                                         amrex::Vector<amrex::Vector<amrex::FArrayBox>>& bdy_data_yhi,
+                                     amrex::Vector<amrex::Vector<amrex::FArrayBox>>& bdy_data_xlo,
+                                     amrex::Vector<amrex::Vector<amrex::FArrayBox>>& bdy_data_xhi,
+                                     amrex::Vector<amrex::Vector<amrex::FArrayBox>>& bdy_data_ylo,
+                                     amrex::Vector<amrex::Vector<amrex::FArrayBox>>& bdy_data_yhi,
+                                     const amrex::MultiFab& mf_MUB,
+                                     const amrex::MultiFab& mf_C1H,
+                                     const amrex::MultiFab& mf_C2H,
+                                     const amrex::MultiFab& mf_C1F,
+                                     const amrex::MultiFab& mf_C2F,
+                                         const amrex::MultiFab& mf_DNW,
+                                         const amrex::MultiFab& mf_PH_wrfin,
+                                         const amrex::MultiFab& mf_PHB_wrfin,
+                                         const amrex::MultiFab& mf_HGT_wrfin,
+                                         const amrex::MultiFab& z_phys_nd,
+                                         const amrex::MultiFab& z_phys_cc,
                                          std::unique_ptr<ReadBndryPlanes>& m_r2d);
 
 /*
@@ -224,7 +236,6 @@ realbdy_compute_relaxation (const int& icomp,
                             const amrex::Array4<const amrex::Real>& v_xhi,
                             const amrex::Array4<const amrex::Real>& v_ylo,
                             const amrex::Array4<const amrex::Real>& v_yhi,
-                            const amrex::Array4<const amrex::Real>& rho_cc_arr,
                             const amrex::Array4<const amrex::Real>& data_arr,
                             const amrex::Array4<amrex::Real>& rhs_arr,
                             const amrex::Real& nudge_scale,
@@ -235,7 +246,6 @@ realbdy_compute_relaxation (const int& icomp,
                             const bool& do_upwind,
                             const bool y_face_owns_corners = false,
                             const bool y_face_use_max_metric = true,
-                            const bool use_primitive_rhs = false,
                             const int weight_profile_id = 0,
                             const amrex::Real weight_tanh_beta = amrex::Real(2.5))
 {
@@ -263,22 +273,7 @@ realbdy_compute_relaxation (const int& icomp,
         amrex::Real Factor = std::max(wx,wy);
         if (force_factor >= zero) { Factor = force_factor; }
 
-        int ii = std::min(std::max(i,dom_cc_lo.x),dom_cc_hi.x);
-        int jj = std::min(std::max(j,dom_cc_lo.y),dom_cc_hi.y);
-        amrex::Real rho_loc = amrex::max(rho_cc_arr(ii,jj,k,Rho_comp), amrex::Real(1.e-16));
-        if (iv[0] == 1 && iv[1] == 0) {
-            int iim1 = std::min(std::max(i-1,dom_cc_lo.x),dom_cc_hi.x);
-            rho_loc = amrex::max(myhalf * (rho_cc_arr(iim1,jj,k,Rho_comp) + rho_cc_arr(ii,jj,k,Rho_comp)), amrex::Real(1.e-16));
-        } else if (iv[0] == 0 && iv[1] == 1) {
-            int jjm1 = std::min(std::max(j-1,dom_cc_lo.y),dom_cc_hi.y);
-            rho_loc = amrex::max(myhalf * (rho_cc_arr(ii,jjm1,k,Rho_comp) + rho_cc_arr(ii,jj,k,Rho_comp)), amrex::Real(1.e-16));
-        }
         amrex::Real delta = arr_xlo(i  ,j  ,k,n) - data_arr(i  ,j  ,k  ,n+icomp);
-        if (use_primitive_rhs) {
-            amrex::Real targ_prim = arr_xlo(i,j,k,n) / rho_loc;
-            amrex::Real cur_prim  = data_arr(i,j,k,n+icomp) / rho_loc;
-            delta = targ_prim - cur_prim;
-        }
         amrex::Real Temp  = nudge_scale * Factor*F1*delta;
         if (!do_upwind) {
             rhs_arr(i,j,k,n+icomp) += Temp;
@@ -311,22 +306,7 @@ realbdy_compute_relaxation (const int& icomp,
         amrex::Real Factor = std::max(wx,wy);
         if (force_factor >= zero) { Factor = force_factor; }
 
-        int ii = std::min(std::max(i,dom_cc_lo.x),dom_cc_hi.x);
-        int jj = std::min(std::max(j,dom_cc_lo.y),dom_cc_hi.y);
-        amrex::Real rho_loc = amrex::max(rho_cc_arr(ii,jj,k,Rho_comp), amrex::Real(1.e-16));
-        if (iv[0] == 1 && iv[1] == 0) {
-            int iim1 = std::min(std::max(i-1,dom_cc_lo.x),dom_cc_hi.x);
-            rho_loc = amrex::max(myhalf * (rho_cc_arr(iim1,jj,k,Rho_comp) + rho_cc_arr(ii,jj,k,Rho_comp)), amrex::Real(1.e-16));
-        } else if (iv[0] == 0 && iv[1] == 1) {
-            int jjm1 = std::min(std::max(j-1,dom_cc_lo.y),dom_cc_hi.y);
-            rho_loc = amrex::max(myhalf * (rho_cc_arr(ii,jjm1,k,Rho_comp) + rho_cc_arr(ii,jj,k,Rho_comp)), amrex::Real(1.e-16));
-        }
         amrex::Real delta = arr_xhi(i  ,j  ,k,n) - data_arr(i  ,j  ,k  ,n+icomp);
-        if (use_primitive_rhs) {
-            amrex::Real targ_prim = arr_xhi(i,j,k,n) / rho_loc;
-            amrex::Real cur_prim  = data_arr(i,j,k,n+icomp) / rho_loc;
-            delta = targ_prim - cur_prim;
-        }
         amrex::Real Temp  = nudge_scale * Factor*F1*delta;
         if (!do_upwind) {
             rhs_arr(i,j,k,n+icomp) += Temp;
@@ -361,22 +341,7 @@ realbdy_compute_relaxation (const int& icomp,
                                  ? std::max(wx,wy) : wy;
         if (force_factor >= zero) { Factor = force_factor; }
 
-        int ii = std::min(std::max(i,dom_cc_lo.x),dom_cc_hi.x);
-        int jj = std::min(std::max(j,dom_cc_lo.y),dom_cc_hi.y);
-        amrex::Real rho_loc = amrex::max(rho_cc_arr(ii,jj,k,Rho_comp), amrex::Real(1.e-16));
-        if (iv[0] == 1 && iv[1] == 0) {
-            int iim1 = std::min(std::max(i-1,dom_cc_lo.x),dom_cc_hi.x);
-            rho_loc = amrex::max(myhalf * (rho_cc_arr(iim1,jj,k,Rho_comp) + rho_cc_arr(ii,jj,k,Rho_comp)), amrex::Real(1.e-16));
-        } else if (iv[0] == 0 && iv[1] == 1) {
-            int jjm1 = std::min(std::max(j-1,dom_cc_lo.y),dom_cc_hi.y);
-            rho_loc = amrex::max(myhalf * (rho_cc_arr(ii,jjm1,k,Rho_comp) + rho_cc_arr(ii,jj,k,Rho_comp)), amrex::Real(1.e-16));
-        }
         amrex::Real delta = arr_ylo(i  ,j  ,k,n) - data_arr(i  ,j  ,k  ,n+icomp);
-        if (use_primitive_rhs) {
-            amrex::Real targ_prim = arr_ylo(i,j,k,n) / rho_loc;
-            amrex::Real cur_prim  = data_arr(i,j,k,n+icomp) / rho_loc;
-            delta = targ_prim - cur_prim;
-        }
         amrex::Real Temp  = nudge_scale * Factor*F1*delta;
         if (!do_upwind) {
             rhs_arr(i,j,k,n+icomp) += Temp;
@@ -407,22 +372,7 @@ realbdy_compute_relaxation (const int& icomp,
                                  ? std::max(wx,wy) : wy;
         if (force_factor >= zero) { Factor = force_factor; }
 
-        int ii = std::min(std::max(i,dom_cc_lo.x),dom_cc_hi.x);
-        int jj = std::min(std::max(j,dom_cc_lo.y),dom_cc_hi.y);
-        amrex::Real rho_loc = amrex::max(rho_cc_arr(ii,jj,k,Rho_comp), amrex::Real(1.e-16));
-        if (iv[0] == 1 && iv[1] == 0) {
-            int iim1 = std::min(std::max(i-1,dom_cc_lo.x),dom_cc_hi.x);
-            rho_loc = amrex::max(myhalf * (rho_cc_arr(iim1,jj,k,Rho_comp) + rho_cc_arr(ii,jj,k,Rho_comp)), amrex::Real(1.e-16));
-        } else if (iv[0] == 0 && iv[1] == 1) {
-            int jjm1 = std::min(std::max(j-1,dom_cc_lo.y),dom_cc_hi.y);
-            rho_loc = amrex::max(myhalf * (rho_cc_arr(ii,jjm1,k,Rho_comp) + rho_cc_arr(ii,jj,k,Rho_comp)), amrex::Real(1.e-16));
-        }
         amrex::Real delta = arr_yhi(i  ,j  ,k,n) - data_arr(i  ,j  ,k  ,n+icomp);
-        if (use_primitive_rhs) {
-            amrex::Real targ_prim = arr_yhi(i,j,k,n) / rho_loc;
-            amrex::Real cur_prim  = data_arr(i,j,k,n+icomp) / rho_loc;
-            delta = targ_prim - cur_prim;
-        }
         amrex::Real Temp  = nudge_scale * Factor*F1*delta;
         if (!do_upwind) {
             rhs_arr(i,j,k,n+icomp) += Temp;
@@ -481,6 +431,7 @@ ApplyInvertedMask (amrex::MultiFab& dst,
         }
     }
 }
+
 
 void
 thinbody_wall_dist (std::unique_ptr<amrex::MultiFab>& wdist,

@@ -111,8 +111,8 @@ read_from_wrfbdy (const int itime, const std::string& nc_bdy_file, const Box& do
 {
     int ioproc = ParallelDescriptor::IOProcessorNumber();  // I/O rank
 
-    // Even though we may not read in all the variables, we need to make the arrays big enough for them (for now)
-    int nvars = WRFBdyVars::NumTypes*4;
+    // Number of var/face entries actually read is set from active prefix list below.
+    int nvars = 0;
 
     const auto& lo = domain.loVect();
     const auto& hi = domain.hiVect();
@@ -123,13 +123,39 @@ read_from_wrfbdy (const int itime, const std::string& nc_bdy_file, const Box& do
 
     // ******************************************************************
     // Read the netcdf file and fill these FABs
-    // NOTE: the order and number of these must match the WRFBdyVars enum!
-    // WRFBdyVars:  U, V, R, T, QV, MU, PC
+    // NOTE: the order and number of these must match WRFBdyVars for active prefixes.
+    // Legacy prefixes first: U, V, T, QVAPOR, MU, PC
+    // Optional staged additions at end: W, PH
     //
-    // These fields are at myhalf levels (unstaggered)
+    // Most fields are at half levels (unstaggered in z), but W/PH are
+    // full-level (z-staggered); staggering is handled in fill_fab_from_arrays.
     // ******************************************************************
     Vector<std::string> nc_var_names;
-    Vector<std::string> nc_var_prefix = {"U","V","T","QVAPOR","MU","PC"};
+    Vector<std::string> nc_var_prefix_all = {"U","V","T","QVAPOR","MU","PC","W","PH"};
+    static int n_prefix_active = 8; // default reads full set needed by modern BC diagnostics/remap
+    {
+        static bool first = true;
+        if (first) {
+            first = false;
+            ParmParse pp("erf");
+            pp.query("dbg_wrfbdy_num_prefix_to_read", n_prefix_active);
+            bool want_theta_remap = false;
+            bool want_wrf_rho_interp = false;
+            pp.query("realbdy_vertical_remap_theta", want_theta_remap);
+            pp.query("dbg_realbdy_use_wrf_rho_interp", want_wrf_rho_interp);
+            n_prefix_active = std::max(1, std::min(n_prefix_active, static_cast<int>(nc_var_prefix_all.size())));
+            if ((want_theta_remap || want_wrf_rho_interp) && n_prefix_active < 8) {
+                Print() << "[WRFBdy staged read] overriding prefix count from "
+                        << n_prefix_active << " to 8 because a PH-dependent option is enabled."
+                        << std::endl;
+                n_prefix_active = 8;
+            }
+            Print() << "[WRFBdy staged read] active prefix count = " << n_prefix_active
+                    << " (1:U ... 6:legacy ... 7:+W ... 8:+W+PH)" << std::endl;
+        }
+    }
+    Vector<std::string> nc_var_prefix(nc_var_prefix_all.begin(),
+                                      nc_var_prefix_all.begin() + n_prefix_active);
 
     for (int ip = 0; ip < nc_var_prefix.size(); ++ip)
     {
@@ -138,6 +164,7 @@ read_from_wrfbdy (const int itime, const std::string& nc_bdy_file, const Box& do
        nc_var_names.push_back(nc_var_prefix[ip] + "_BYS");
        nc_var_names.push_back(nc_var_prefix[ip] + "_BYE");
     }
+    nvars = static_cast<int>(nc_var_names.size());
 
     using RARRAY = NDArray<float>;
     Vector<RARRAY> tslice(nc_var_names.size());
@@ -187,6 +214,10 @@ read_from_wrfbdy (const int itime, const std::string& nc_bdy_file, const Box& do
             bdyVarType = WRFBdyVars::MU;
         } else if (first2 == "PC") {
             bdyVarType = WRFBdyVars::PC;
+        } else if (first1 == "W") {
+            bdyVarType = WRFBdyVars::W;
+        } else if (first2 == "PH") {
+            bdyVarType = WRFBdyVars::PH;
         } else {
             Print() << "Trying to read " << first1 << " or " << first2 << std::endl;
             Abort("dont know this variable");
@@ -233,6 +264,9 @@ read_from_wrfbdy (const int itime, const std::string& nc_bdy_file, const Box& do
                 bdy_data_xlo[itime].push_back(FArrayBox(xlo_plane_no_stag, 1, Arena_Used)); // T
             } else if (bdyVarType == WRFBdyVars::QV) {
                 bdy_data_xlo[itime].push_back(FArrayBox(xlo_plane_no_stag, 1, Arena_Used)); // QV
+            } else if (bdyVarType == WRFBdyVars::W ||
+                       bdyVarType == WRFBdyVars::PH) {
+                bdy_data_xlo[itime].push_back(FArrayBox(surroundingNodes(xlo_plane_no_stag,2), 1, Arena_Used)); // W/PH
             } else if (bdyVarType == WRFBdyVars::MU ||
                        bdyVarType == WRFBdyVars::PC) {
                 bdy_data_xlo[itime].push_back(FArrayBox(xlo_line, 1, Arena_Used));
@@ -261,6 +295,9 @@ read_from_wrfbdy (const int itime, const std::string& nc_bdy_file, const Box& do
                 bdy_data_xhi[itime].push_back(FArrayBox(xhi_plane_no_stag, 1, Arena_Used)); // T
             } else if (bdyVarType == WRFBdyVars::QV) {
                 bdy_data_xhi[itime].push_back(FArrayBox(xhi_plane_no_stag, 1, Arena_Used)); // QV
+            } else if (bdyVarType == WRFBdyVars::W ||
+                       bdyVarType == WRFBdyVars::PH) {
+                bdy_data_xhi[itime].push_back(FArrayBox(surroundingNodes(xhi_plane_no_stag,2), 1, Arena_Used)); // W/PH
             } else if (bdyVarType == WRFBdyVars::MU ||
                        bdyVarType == WRFBdyVars::PC) {
                 bdy_data_xhi[itime].push_back(FArrayBox(xhi_line, 1, Arena_Used)); // MU
@@ -289,6 +326,9 @@ read_from_wrfbdy (const int itime, const std::string& nc_bdy_file, const Box& do
                 bdy_data_ylo[itime].push_back(FArrayBox(ylo_plane_no_stag, 1, Arena_Used)); // T
             } else if (bdyVarType == WRFBdyVars::QV) {
                 bdy_data_ylo[itime].push_back(FArrayBox(ylo_plane_no_stag, 1, Arena_Used)); // QV
+            } else if (bdyVarType == WRFBdyVars::W ||
+                       bdyVarType == WRFBdyVars::PH) {
+                bdy_data_ylo[itime].push_back(FArrayBox(surroundingNodes(ylo_plane_no_stag,2), 1, Arena_Used)); // W/PH
             } else if (bdyVarType == WRFBdyVars::MU ||
                        bdyVarType == WRFBdyVars::PC) {
                 bdy_data_ylo[itime].push_back(FArrayBox(ylo_line, 1, Arena_Used)); // PC
@@ -317,6 +357,9 @@ read_from_wrfbdy (const int itime, const std::string& nc_bdy_file, const Box& do
                 bdy_data_yhi[itime].push_back(FArrayBox(yhi_plane_no_stag, 1, Arena_Used)); // T
             } else if (bdyVarType == WRFBdyVars::QV) {
                 bdy_data_yhi[itime].push_back(FArrayBox(yhi_plane_no_stag, 1, Arena_Used)); // QV
+            } else if (bdyVarType == WRFBdyVars::W ||
+                       bdyVarType == WRFBdyVars::PH) {
+                bdy_data_yhi[itime].push_back(FArrayBox(surroundingNodes(yhi_plane_no_stag,2), 1, Arena_Used)); // W/PH
             } else if (bdyVarType == WRFBdyVars::MU ||
                        bdyVarType == WRFBdyVars::PC) {
                 bdy_data_yhi[itime].push_back(FArrayBox(yhi_line, 1, Arena_Used)); // PC
@@ -336,7 +379,8 @@ read_from_wrfbdy (const int itime, const std::string& nc_bdy_file, const Box& do
             Array4<Real> fab_arr;
 
             if (bdyVarType == WRFBdyVars::U || bdyVarType == WRFBdyVars::V ||
-                bdyVarType == WRFBdyVars::T || bdyVarType == WRFBdyVars::QV)
+                bdyVarType == WRFBdyVars::T || bdyVarType == WRFBdyVars::QV ||
+                bdyVarType == WRFBdyVars::W || bdyVarType == WRFBdyVars::PH)
             {
                 // xlo,xhi dims: (Time, bdy_width, bottom_top, south_north)
                 // ylo,yhi dims: (Time, bdy_width, bottom_top, west_east)
@@ -352,7 +396,8 @@ read_from_wrfbdy (const int itime, const std::string& nc_bdy_file, const Box& do
                         int i = n / (ns2 * ns3);
                         if (i >= real_width) continue;
                         int k = (n - i * (ns2 * ns3)) / ns3;
-                        if (k > khi) continue;
+                        int kmax = (bdyVarType == WRFBdyVars::W || bdyVarType == WRFBdyVars::PH) ? khi+1 : khi;
+                        if (k > kmax) continue;
                         int j =  n - i * (ns2 * ns3) - k * ns3;
                         fab_arr(ioff+i, j, k, 0) = static_cast<Real>(*(tslice[iv].get_data() + n));
                     }
@@ -364,7 +409,8 @@ read_from_wrfbdy (const int itime, const std::string& nc_bdy_file, const Box& do
                         int i = n / (ns2 * ns3);
                         if (i >= real_width) continue;
                         int k = (n - i * (ns2 * ns3)) / ns3;
-                        if (k > khi) continue;
+                        int kmax = (bdyVarType == WRFBdyVars::W || bdyVarType == WRFBdyVars::PH) ? khi+1 : khi;
+                        if (k > kmax) continue;
                         int j =  n - i * (ns2 * ns3) - k * ns3;
                         fab_arr(ioff-i, j, k, 0) = static_cast<Real>(*(tslice[iv].get_data() + n));
                     }
@@ -376,7 +422,8 @@ read_from_wrfbdy (const int itime, const std::string& nc_bdy_file, const Box& do
                         int j = n / (ns2 * ns3);
                         if (j >= real_width) continue;
                         int k = (n - j * (ns2 * ns3)) / ns3;
-                        if (k > khi) continue;
+                        int kmax = (bdyVarType == WRFBdyVars::W || bdyVarType == WRFBdyVars::PH) ? khi+1 : khi;
+                        if (k > kmax) continue;
                         int i =  n - j * (ns2 * ns3) - k * ns3;
                         fab_arr(i, joff+j, k, 0) = static_cast<Real>(*(tslice[iv].get_data() + n));
                     }
@@ -388,7 +435,8 @@ read_from_wrfbdy (const int itime, const std::string& nc_bdy_file, const Box& do
                         int j = n / (ns2 * ns3);
                         if (j >= real_width) continue;
                         int k = (n - j * (ns2 * ns3)) / ns3;
-                        if (k > khi) continue;
+                        int kmax = (bdyVarType == WRFBdyVars::W || bdyVarType == WRFBdyVars::PH) ? khi+1 : khi;
+                        if (k > kmax) continue;
                         int i =  n - j * (ns2 * ns3) - k * ns3;
                         fab_arr(i, joff-j, k, 0) = static_cast<Real>(*(tslice[iv].get_data() + n));
                     }
@@ -453,7 +501,10 @@ read_from_wrfbdy (const int itime, const std::string& nc_bdy_file, const Box& do
     // When an FArrayBox is built, space is allocated on every rank.  However, we only
     //    filled the data in these FABs on the IOProcessor.  So here we broadcast
     //    the data to every rank.
-    int n_per_time = nc_var_prefix.size();
+    int n_per_time = bdy_data_xlo[itime].size();
+    AMREX_ALWAYS_ASSERT(bdy_data_xhi[itime].size() == n_per_time);
+    AMREX_ALWAYS_ASSERT(bdy_data_ylo[itime].size() == n_per_time);
+    AMREX_ALWAYS_ASSERT(bdy_data_yhi[itime].size() == n_per_time);
     for (int i = 0; i < n_per_time; i++)
     {
         ParallelDescriptor::Bcast(bdy_data_xlo[itime][i].dataPtr(),bdy_data_xlo[itime][i].box().numPts(),ioproc);
@@ -481,10 +532,10 @@ convert_wrfbdy_data (const int itime,
     std::unique_ptr<iMultiFab> mask_u = OwnerMask(xvel, geom.periodicity());
     std::unique_ptr<iMultiFab> mask_v = OwnerMask(yvel, geom.periodicity());
 
-    // Temporary bdy data structures for global reductions
-    int vsize = bdy_data[itime].size() - 2; // Don't do MU & PC
-    amrex::Vector<amrex::FArrayBox> bdy_data_tmp; bdy_data_tmp.resize(vsize);
-    for (int ivar(0); ivar < vsize; ++ivar) {
+    // Temporary bdy data structures for global reductions (only vars we convert here).
+    constexpr int n_convert = 4; // U, V, T, QV
+    amrex::Vector<amrex::FArrayBox> bdy_data_tmp; bdy_data_tmp.resize(n_convert);
+    for (int ivar(0); ivar < n_convert; ++ivar) {
         bdy_data_tmp[ivar].resize(bdy_data[itime][ivar].box(),1,The_Managed_Arena());
         bdy_data_tmp[ivar].template setVal<RunOn::Device>(0);
     }
@@ -593,7 +644,7 @@ convert_wrfbdy_data (const int itime,
         });
     } // mfi
 
-    for (int ivar(0); ivar < vsize; ++ivar) {
+    for (int ivar(0); ivar < n_convert; ++ivar) {
         amrex::ParallelAllReduce::Sum(bdy_data_tmp[ivar].dataPtr(),
                                       bdy_data_tmp[ivar].size(),
                                       ParallelContext::CommunicatorAll());
