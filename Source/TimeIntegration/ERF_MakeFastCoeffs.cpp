@@ -126,22 +126,20 @@ void make_fast_coeffs (int /*level*/,
                  Real qv_p = (l_use_moisture) ? prim(i,j,k  ,PrimQ1_comp) : zero;
                  Real qv_q = (l_use_moisture) ? prim(i,j,k-1,PrimQ1_comp) : zero;
 
-                 Real coeff_P = -Gamma * R_d * dzi * inv_detJ_on_kface * (one + RvOverRd*qv_p)
-                               +  halfg * R_d * rhobar_hi /
+                 Real coeff_P = -Gamma * R_d * dzi * inv_detJ_on_kface * pi_c * (one + RvOverRd*qv_p)
+                              +  halfg * R_d * rhobar_hi * pi_stage_ca(i,j,k) /
                                (  c_v * pibar_hi * stage_cons(i,j,k,RhoTheta_comp) );
-                 coeff_P *= pi_c;
 
-                 Real coeff_Q =  Gamma * R_d * dzi * inv_detJ_on_kface * (one + RvOverRd*qv_q)
-                               + halfg * R_d * rhobar_lo /
+                 Real coeff_Q =  Gamma * R_d * dzi * inv_detJ_on_kface * pi_c * (one + RvOverRd*qv_q)
+                              + halfg * R_d * rhobar_lo * pi_stage_ca(i,j,k-1) /
                                ( c_v  * pibar_lo * stage_cons(i,j,k-1,RhoTheta_comp) );
-                 coeff_Q *= pi_c;
 
                  coeffP_a(i,j,k) = coeff_P;
                  coeffQ_a(i,j,k) = coeff_Q;
 
                 if (l_use_moisture) {
                     Real q = myhalf * ( prim(i,j,k,PrimQ1_comp) + prim(i,j,k-1,PrimQ1_comp)
-                                    +prim(i,j,k,PrimQ2_comp) + prim(i,j,k-1,PrimQ2_comp) );
+                                      + prim(i,j,k,PrimQ2_comp) + prim(i,j,k-1,PrimQ2_comp) );
                     coeff_P /= (one + q);
                     coeff_Q /= (one + q);
                 }
@@ -155,7 +153,8 @@ void make_fast_coeffs (int /*level*/,
                 coeffA_a(i,j,k) = D * (one/detJ(i,j,k-1)) * ( halfg - coeff_Q * theta_t_lo );
                 coeffC_a(i,j,k) = D * (one/detJ(i,j,k  )) * (-halfg + coeff_P * theta_t_hi );
 
-                coeffB_a(i,j,k) = one + D * (coeff_Q/detJ(i,j,k-1) - coeff_P/detJ(i,j,k)) * theta_t_mid;
+                coeffB_a(i,j,k) = one + D * ( (coeff_Q/detJ(i,j,k-1) - coeff_P/detJ(i,j,k)) * theta_t_mid
+                                            + halfg * (Real(1.0)/detJ(i,j,k) - Real(1.0)/detJ(i,j,k-1)) );
             });
 
         } else {
@@ -173,22 +172,20 @@ void make_fast_coeffs (int /*level*/,
                  Real qv_p = (l_use_moisture) ? prim(i,j,k  ,PrimQ1_comp) : zero;
                  Real qv_q = (l_use_moisture) ? prim(i,j,k-1,PrimQ1_comp) : zero;
 
-                 Real coeff_P = -Gamma * R_d * dzi * (one + RvOverRd*qv_p)
-                              +  halfg * R_d * rhobar_hi /
+                 Real coeff_P = -Gamma * R_d * dzi * pi_c * (one + RvOverRd*qv_p)
+                              +  halfg * R_d * rhobar_hi * pi_stage_ca(i,j,k) /
                               (  c_v * pibar_hi * stage_cons(i,j,k,RhoTheta_comp) );
-                 coeff_P *= pi_c;
 
-                 Real coeff_Q = Gamma * R_d * dzi * (one + RvOverRd*qv_q)
-                              + halfg * R_d * rhobar_lo /
+                 Real coeff_Q = Gamma * R_d * dzi * pi_c * (one + RvOverRd*qv_q)
+                              + halfg * R_d * rhobar_lo * pi_stage_ca(i,j,k-1) /
                               ( c_v  * pibar_lo * stage_cons(i,j,k-1,RhoTheta_comp) );
-                 coeff_Q *= pi_c;
 
                  coeffP_a(i,j,k) = coeff_P;
                  coeffQ_a(i,j,k) = coeff_Q;
 
                 if (l_use_moisture) {
                     Real q = myhalf * ( prim(i,j,k,PrimQ1_comp) + prim(i,j,k-1,PrimQ1_comp)
-                                    +prim(i,j,k,PrimQ2_comp) + prim(i,j,k-1,PrimQ2_comp) );
+                                      + prim(i,j,k,PrimQ2_comp) + prim(i,j,k-1,PrimQ2_comp) );
                     coeff_P /= (one + q);
                     coeff_Q /= (one + q);
                 }

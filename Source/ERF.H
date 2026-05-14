@@ -137,6 +137,9 @@ public:
     // Advance solution to final time
     void Evolve ();
 
+    void PackAtmosphericStates (amrex::Vector<amrex::MultiFab*>& states, amrex::Real time);
+    void ApplyOceanSurfaceState (const amrex::Vector<amrex::MultiFab*>& state, amrex::Real time);
+
     // Tag cells for refinement
     void ErrorEst (int lev, amrex::TagBoxArray& tags, amrex::Real time, int ngrow) override;
 
@@ -166,6 +169,8 @@ public:
     amrex::Vector<amrex::MultiFab> surface_state_1,
                                    surface_state_2,
                                    surface_state_interp;
+
+    amrex::Vector<amrex::Vector<amrex::MultiFab>> bckgnd_state;
 
     std::string MakeVTKFilename(int nstep);
     std::string MakeVTKFilename_TrackerCircle(int nstep);
@@ -496,17 +501,22 @@ public:
                                   amrex::Vector<std::unique_ptr<amrex::MultiFab>>& z_phys_nd,
                                   bool regrid_forces_file_read);
 
+    void create_background_state_for_ensemble (int lev,
+                                               amrex::MultiFab& mf_cc_pert,
+                                               amrex::MultiFab& cons_pert,
+                                               amrex::MultiFab& xvel_pert,
+                                               amrex::MultiFab& yvel_pert,
+                                               amrex::MultiFab& zvel_pert);
+
     void create_random_perturbations (const int lev,
-                                      amrex::MultiFab& cons_pert,
-                                      amrex::MultiFab& xvel_pert,
-                                      amrex::MultiFab& yvel_pert,
-                                      amrex::MultiFab& zvel_pert);
+                                      amrex::MultiFab& mf_cc_pert);
 
     void apply_gaussian_smoothing_to_perturbations (const int lev,
-                                                    amrex::MultiFab& cons_pert,
-                                                    amrex::MultiFab& xvel_pert,
-                                                    amrex::MultiFab& yvel_pert,
-                                                    amrex::MultiFab& zvel_pert);
+                                                    amrex::MultiFab& mf_cc_pert);
+
+    void ComputeAndWriteEnsemblePerturbations();
+
+    void PerformDataAssimilation(int da_iter);
 
     void init_custom (int lev);
 

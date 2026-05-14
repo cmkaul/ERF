@@ -877,10 +877,13 @@ Data along query lines or planes may be output during the simulation if
 The potential temperature and wind-speed will be written to native ``plt_line/plane``
 at the step frequency dictated by ``erf.line_sampling_interval = <int>`` or
 ``erf.plane_sampling_interval = <int>``. For line sampling,
-users must prescribe ``sample_line_lo`` and ``sample_line_hi`` inputs which are 3 integer
-values corresponding to the (i,j,k) indices at the beginning and end of the line.
-Additionally, users must specify ``sample_line_dir`` to prescribed the direction of
-the line. The same inputs are used for the plane sampling except that ``sample_plane_lo/hi``
+users must prescribe either ``sample_line_lo`` and ``sample_line_hi`` inputs, which are
+3 integer values corresponding to the (i,j,k) indices at the beginning and end of the line,
+or ``sample_line_lo_real`` and ``sample_line_hi_real``, which are 3 real values corresponding
+to the physical locations of the beginning and end of the line. These two ways of specifying
+the line are mutually exclusive. Additionally, users must specify ``sample_line_dir`` to
+prescribed the direction of the line. The same inputs are used for the plane sampling except
+that ``sample_plane_lo/hi``
 must be the physical locations of the plane corners. This output functionality has
 not been implemented for terrain. By default, sampled line and plane data will have the
 prefixes "plt_line" and "plt_plane", respectively. Names for sampled data may optionally
@@ -932,6 +935,9 @@ List of Parameters
 +-----------------------------------+------------------+----------------+----------------+
 | **erf.sample_line_lo/hi**         | Bounding (i,j,k) | 3 Integers per | None           |
 |                                   | on the line(s)   | line           |                |
++-----------------------------------+------------------+----------------+----------------+
+| **erf.sample_line_lo_real/**      | Bounding point   | 3 Reals per    | None           |
+| **hi_real**                       | on the line(s)   | line           |                |
 +-----------------------------------+------------------+----------------+----------------+
 | **erf.sample_plane_lo/hi**        | Bounding point   | 3 Reals per    | None           |
 |                                   | on the plane(s)  | plane          |                |
@@ -1639,12 +1645,6 @@ List of Parameters
 |                                  | use_real_bcs is     |                    |                       |
 |                                  | true                |                    |                       |
 +----------------------------------+---------------------+--------------------+-----------------------+
-| **erf.real_set_width**           | Lateral boundary    |  Integer           | 0                     |
-|                                  | specified zone      |                    |                       |
-|                                  | width if            |                    |                       |
-|                                  | use_real_bcs is     |                    |                       |
-|                                  | true                |                    |                       |
-+----------------------------------+---------------------+--------------------+-----------------------+
 | **erf.real_extrap_w**            | First-order         | bool               | true                  |
 |                                  | extrapolation of    |                    |                       |
 |                                  | vertical velocities |                    |                       |
@@ -1757,9 +1757,7 @@ specified by ``erf.nc_bdy_file`` (e.g., "wrfbdy_d01").  (If **erf.use_real_bcs =
 boundary conditions so they must be specified in the inputs file.)
 
 If **erf.use_real_bcs = true**,
-the extent of the relaxation zone may be controlled with ``erf.real_width`` (corresponding to WRF's **spec_bdy_width**)
-and ``erf.real_set_width`` (corresponding to WRF's **spec_zone**, typically set to 1), which corresponds to a relaxation zone with a
-width of **real_width - real_set_width**.
+the extent of the relaxation zone may be controlled with ``erf.real_width`` (corresponding to WRF's **spec_bdy_width**).
 
 Note that the **erf.project_initial_velocity** option is available for all **init_type** options.  If using the anelastic
 formulation this will be true regardless of the input; if using the compressible formulation the default is false but

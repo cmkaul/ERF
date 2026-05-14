@@ -288,9 +288,9 @@ void erf_substep_T (int step, int /*nrk*/,
                 Real gp_xi = (theta_extrap(i,j,k) - theta_extrap(i-1,j,k)) * dxi;
                 Real gp_zeta_on_iface = (k == 0) ?
                    myhalf  * dzi * ( theta_extrap(i-1,j,k+1) + theta_extrap(i,j,k+1)
-                                 -theta_extrap(i-1,j,k  ) - theta_extrap(i,j,k  ) ) :
+                                   - theta_extrap(i-1,j,k  ) - theta_extrap(i,j,k  ) ) :
                    fourth * dzi * ( theta_extrap(i-1,j,k+1) + theta_extrap(i,j,k+1)
-                                 -theta_extrap(i-1,j,k-1) - theta_extrap(i,j,k-1) );
+                                  - theta_extrap(i-1,j,k-1) - theta_extrap(i,j,k-1) );
                 Real gpx = gp_xi - (met_h_xi / met_h_zeta) * gp_zeta_on_iface;
                 gpx *= mf_ux(i,j,0);
 
@@ -320,9 +320,9 @@ void erf_substep_T (int step, int /*nrk*/,
                 Real gp_eta = (theta_extrap(i,j,k) -theta_extrap(i,j-1,k)) * dyi;
                 Real gp_zeta_on_jface = (k == 0) ?
                     myhalf  * dzi * ( theta_extrap(i,j,k+1) + theta_extrap(i,j-1,k+1)
-                                  -theta_extrap(i,j,k  ) - theta_extrap(i,j-1,k  ) ) :
+                                    - theta_extrap(i,j,k  ) - theta_extrap(i,j-1,k  ) ) :
                     fourth * dzi * ( theta_extrap(i,j,k+1) + theta_extrap(i,j-1,k+1)
-                                  -theta_extrap(i,j,k-1) - theta_extrap(i,j-1,k-1) );
+                                   - theta_extrap(i,j,k-1) - theta_extrap(i,j-1,k-1) );
                 Real gpy = gp_eta - (met_h_eta / met_h_zeta) * gp_zeta_on_jface;
                 gpy *= mf_vy(i,j,0);
 
@@ -368,7 +368,6 @@ void erf_substep_T (int step, int /*nrk*/,
 
         const Array4<const Real> & stage_zmom = S_stage_data[IntVars::zmom].const_array(mfi);
         const Array4<const Real> & prim       = S_stage_prim.const_array(mfi);
-        const Array4<const Real> & qt_arr     = qt.const_array(mfi);
 
         const Array4<Real>& old_drho_u     = Delta_rho_u.array(mfi);
         const Array4<Real>& old_drho_v     = Delta_rho_v.array(mfi);
@@ -532,10 +531,8 @@ void erf_substep_T (int step, int /*nrk*/,
         //Note we don't act on the bottom or top boundaries of the domain
         ParallelFor(bx_shrunk_in_k, [=] AMREX_GPU_DEVICE (int i, int j, int k)
         {
-            Real q = (l_use_moisture) ? myhalf * (qt_arr(i,j,k) + qt_arr(i,j,k-1)) : zero;
-
-            Real coeff_P = coeffP_a(i,j,k) / (one + q);
-            Real coeff_Q = coeffQ_a(i,j,k) / (one + q);
+            Real coeff_P = coeffP_a(i,j,k);
+            Real coeff_Q = coeffQ_a(i,j,k);
 
             Real theta_t_lo  = myhalf * ( prim(i,j,k-2,PrimTheta_comp) + prim(i,j,k-1,PrimTheta_comp) );
             Real theta_t_mid = myhalf * ( prim(i,j,k-1,PrimTheta_comp) + prim(i,j,k  ,PrimTheta_comp) );

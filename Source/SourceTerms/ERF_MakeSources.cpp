@@ -443,7 +443,7 @@ void make_sources (int level,
         // *************************************************************************************
         // Real(8.) Add perturbation
         // *************************************************************************************
-        if (solverChoice.pert_type == PerturbationType::Source && is_slow_step) {
+        if (solverChoice.use_source_perturbation(level) && is_slow_step) {
             auto m_ixtype = S_data[IntVars::cons].boxArray().ixType(); // Conserved term
             const amrex::Array4<const amrex::Real>& pert_cell = turbPert.pb_cell[level].const_array(mfi);
             turbPert.apply_tpi(level, bx, RhoTheta_comp, m_ixtype, cell_src, pert_cell); // Applied as source term
@@ -540,7 +540,7 @@ void make_sources (int level,
                 }
 
                 // SURFACE HEAT FLUX
-                if (tflux != 1e-8){
+                if (tflux != Real(1e-8)){
                     if (t_blank > 0 && (t_blank_above == zero)) { // force to MOST value
                         Real psi_m           = zero;
                         Real psi_h           = zero;
@@ -573,7 +573,7 @@ void make_sources (int level,
                 }
 
                 // OBUKHOV LENGTH
-                if (Olen_in != 1e-8){
+                if (Olen_in != Real(1e-8)){
                     if (t_blank > 0 && (t_blank_above == zero)) { // force to MOST value
                         const Real Olen  = Olen_in;
                         const Real zeta          = (myhalf) * dx_z / Olen;

@@ -294,7 +294,6 @@ void erf_substep_NS (int step, int nrk,
         const Array4<const Real>& stage_ymom = S_stage_data[IntVars::ymom].const_array(mfi);
         const Array4<const Real>& stage_zmom = S_stage_data[IntVars::zmom].const_array(mfi);
         const Array4<const Real> & prim       = S_stage_prim.const_array(mfi);
-        const Array4<const Real> & qt_arr     = qt.const_array(mfi);
 
         const Array4<const Real>& prev_drho_theta = Delta_rho_theta.array(mfi);
 
@@ -397,10 +396,8 @@ void erf_substep_NS (int step, int nrk,
         //Note we don't act on the bottom or top boundaries of the domain
         ParallelFor(bx_shrunk_in_k, [=] AMREX_GPU_DEVICE (int i, int j, int k)
         {
-            Real q = (l_use_moisture) ? myhalf * (qt_arr(i,j,k) + qt_arr(i,j,k-1)) : zero;
-
-            Real coeff_P = coeffP_a(i,j,k) / (one + q);
-            Real coeff_Q = coeffQ_a(i,j,k) / (one + q);
+            Real coeff_P = coeffP_a(i,j,k);
+            Real coeff_Q = coeffQ_a(i,j,k);
 
             Real theta_t_lo  = myhalf * ( prim(i,j,k-2,PrimTheta_comp) + prim(i,j,k-1,PrimTheta_comp) );
             Real theta_t_mid = myhalf * ( prim(i,j,k-1,PrimTheta_comp) + prim(i,j,k  ,PrimTheta_comp) );
@@ -417,9 +414,8 @@ void erf_substep_NS (int step, int nrk,
                          - halfg * ( old_drho_k + old_drho_km1 );
 
             // lines 3-5 residuals (order dtau^2) one <-> beta_2
-            Real R1_tmp =  halfg * (-slow_rhs_cons(i,j,k  ,Rho_comp)
-                                    -slow_rhs_cons(i,j,k-1,Rho_comp)
-                                    +temp_rhs_arr(i,j,k,0) + temp_rhs_arr(i,j,k-1) )
+            Real R1_tmp =  halfg * (-slow_rhs_cons(i,j,k  ,Rho_comp) - slow_rhs_cons(i,j,k-1,Rho_comp)
+                                    + temp_rhs_arr(i,j,k  ,Rho_comp) +  temp_rhs_arr(i,j,k-1,Rho_comp) )
                 + ( coeff_P * (slow_rhs_cons(i,j,k  ,RhoTheta_comp) - temp_rhs_arr(i,j,k  ,RhoTheta_comp)) +
                     coeff_Q * (slow_rhs_cons(i,j,k-1,RhoTheta_comp) - temp_rhs_arr(i,j,k-1,RhoTheta_comp)) );
 
@@ -536,7 +532,7 @@ void erf_substep_NS (int step, int nrk,
             Real dz_inv = one / dz_ptr[k];
             temp_rhs_arr(i,j,k,Rho_comp     ) += dz_inv * ( zflux_hi - zflux_lo );
             temp_rhs_arr(i,j,k,RhoTheta_comp) += myhalf * dz_inv * ( zflux_hi * (prim(i,j,k) + prim(i,j,k+1))
-                                                                - zflux_lo * (prim(i,j,k) + prim(i,j,k-1)) );
+                                                                   - zflux_lo * (prim(i,j,k) + prim(i,j,k-1)) );
         });
 
         // We only add to the flux registers in the final RK step
