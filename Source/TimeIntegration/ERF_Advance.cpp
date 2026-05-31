@@ -238,6 +238,7 @@ ERF::Advance (int lev, Real time, Real dt_lev, int iteration, int /*ncycle*/)
                    U_new, V_new, W_new,
                    cc_source, xmom_source, ymom_source, zmom_source, buoyancy,
                    Geom(lev), dt_lev, time);
+    AuditQCChanges(lev, S_new, S_new, "after_advance_dycore_before_microphysics", time + dt_lev);
 
     // **************************************************************************************
     // Tests on the reasonableness of the solution after the dycore

@@ -21,8 +21,11 @@ void ERF::advance_microphysics (int lev,
             cons.FillBoundary(geom[lev].periodicity());
         }
         micro->Update_Micro_Vars_Lev(lev, cons);
+        AuditQCChanges(lev, cons, cons, "before_micro_Advance", time + dt_advance);
         micro->Advance(lev, dt_advance, iteration, time, solverChoice, vars_new, z_phys_nd, phys_bc_type);
+        AuditQCChanges(lev, cons, cons, "after_micro_Advance_before_Update_State_Vars_Lev", time + dt_advance);
         micro->Update_State_Vars_Lev(lev, cons, *z_phys_nd[lev]);
+        AuditQCChanges(lev, cons, cons, "after_micro_Update_State_Vars_Lev", time + dt_advance);
 
         // Sync cons[lev-1] covered cells with the moist state just written
         // to cons[lev].  Without this, the next sub-cycle's FillPatchFineLevel

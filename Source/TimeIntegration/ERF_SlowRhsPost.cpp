@@ -3,6 +3,7 @@
 #include <ERF_TI_slow_headers.H>
 #include <ERF_EBAdvection.H>
 #include <ERF_EBRedistribute.H>
+#include <string>
 
 using namespace amrex;
 
@@ -81,6 +82,9 @@ void erf_slow_rhs_post (int level, int finest_level,
                         Gpu::DeviceVector<Real>& stretched_dz_d,
                         Vector<std::unique_ptr<MultiFab>>& mapfac,
                         amrex::EBFArrayBoxFactory const& ebfact,
+                        bool audit_qc_changes,
+                        int step,
+                        Real audit_time,
 #if defined(ERF_USE_NETCDF)
                         const bool& moist_set_rhs_bool,
                         const Real& old_stage_time_total,
@@ -158,6 +162,8 @@ void erf_slow_rhs_post (int level, int finest_level,
     int nvars                     = S_data[IntVars::cons].nComp();
     const BoxArray& ba            = S_data[IntVars::cons].boxArray();
     const DistributionMapping& dm = S_data[IntVars::cons].DistributionMap();
+
+    amrex::ignore_unused(audit_qc_changes, step, audit_time);
 
     std::unique_ptr<MultiFab> dflux_x;
     std::unique_ptr<MultiFab> dflux_y;

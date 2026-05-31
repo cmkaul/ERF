@@ -7,6 +7,9 @@
 */
 
 #include <memory>
+#include <array>
+#include <iomanip>
+#include <limits>
 
 #include "ERF_EOS.H"
 #include "ERF.H"
@@ -29,6 +32,126 @@
 #endif
 
 using namespace amrex;
+
+void
+erf_audit_qc_changes (const Geometry& geom, const MultiFab& field, const MultiFab& rho,
+                      const std::string& label, int lev, int step, Real time, int ring_width,
+                      const std::string& quantity_name)
+{
+    constexpr int nregions = 5;
+
+    const Box& domain = geom.Domain();
+    const int ilo = domain.smallEnd(0);
+    const int ihi = domain.bigEnd(0);
+    const int jlo = domain.smallEnd(1);
+    const int jhi = domain.bigEnd(1);
+    const int klo = domain.smallEnd(2);
+    const int khi = std::min(domain.bigEnd(2), klo + 2);
+    const int nx = domain.length(0);
+    const int ny = domain.length(1);
+    const int w = std::max(1, std::min(ring_width, std::min(nx, ny)));
+    const Real inf = std::numeric_limits<Real>::infinity();
+    const Real nan = std::numeric_limits<Real>::quiet_NaN();
+
+    const std::array<int, 1> comps{{RhoQ2_comp}};
+    const std::array<const char*, nregions> region_names{{"ring", "xlo", "xhi", "ylo", "yhi"}};
+
+    for (int n = 0; n < static_cast<int>(comps.size()); ++n) {
+        const int comp = comps[n];
+        if (field.nComp() <= comp || rho.nComp() <= Rho_comp) {
+            continue;
+        }
+
+        for (int kk = klo; kk <= khi; ++kk) {
+            ReduceOps<ReduceOpSum, ReduceOpSum,
+                      ReduceOpMin, ReduceOpMin, ReduceOpMin, ReduceOpMin, ReduceOpMin,
+                      ReduceOpMax, ReduceOpMax, ReduceOpMax, ReduceOpMax, ReduceOpMax> reduce_op;
+            ReduceData<Real, Long,
+                       Real, Real, Real, Real, Real,
+                       Real, Real, Real, Real, Real> reduce_data(reduce_op);
+            using ReduceTuple = typename decltype(reduce_data)::Type;
+
+            for (MFIter mfi(field, TilingIfNotGPU()); mfi.isValid(); ++mfi) {
+                const Box& bx = mfi.tilebox();
+                const Array4<const Real>& field_arr = field.const_array(mfi);
+                const Array4<const Real>& rho_arr = rho.const_array(mfi);
+
+                reduce_op.eval(bx, reduce_data,
+                [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept -> ReduceTuple
+                {
+                    if (k != kk) {
+                        return {zero, 0L, inf, inf, inf, inf, inf, -inf, -inf, -inf, -inf, -inf};
+                    }
+
+                    const Real val = field_arr(i,j,k,comp) / rho_arr(i,j,k,Rho_comp);
+                    const bool in_xlo = (i < ilo + w);
+                    const bool in_xhi = (i > ihi - w);
+                    const bool in_ylo = (j < jlo + w);
+                    const bool in_yhi = (j > jhi - w);
+                    const bool in_ring = in_xlo || in_xhi || in_ylo || in_yhi;
+                    const bool in_interior = (i >= ilo + w) && (i <= ihi - w) &&
+                                             (j >= jlo + w) && (j <= jhi - w);
+
+                    return {
+                        in_interior ? val : zero,
+                        in_interior ? 1L  : 0L,
+                        in_ring ? val : inf,
+                        in_xlo  ? val : inf,
+                        in_xhi  ? val : inf,
+                        in_ylo  ? val : inf,
+                        in_yhi  ? val : inf,
+                        in_ring ? val : -inf,
+                        in_xlo  ? val : -inf,
+                        in_xhi  ? val : -inf,
+                        in_ylo  ? val : -inf,
+                        in_yhi  ? val : -inf
+                    };
+                });
+            }
+
+            auto hv = reduce_data.value(reduce_op);
+            Real interior_sum = get<0>(hv);
+            Long interior_count = get<1>(hv);
+            Real mins[nregions] = {get<2>(hv), get<3>(hv), get<4>(hv), get<5>(hv), get<6>(hv)};
+            Real maxs[nregions] = {get<7>(hv), get<8>(hv), get<9>(hv), get<10>(hv), get<11>(hv)};
+
+            ParallelDescriptor::ReduceRealSum(interior_sum);
+            ParallelDescriptor::ReduceLongSum(interior_count);
+            ParallelDescriptor::ReduceRealMin(mins, nregions);
+            ParallelDescriptor::ReduceRealMax(maxs, nregions);
+
+            const Real interior_mean = (interior_count > 0) ? interior_sum / static_cast<Real>(interior_count) : nan;
+            for (int ir = 0; ir < nregions; ++ir) {
+                if (mins[ir] == inf) { mins[ir] = nan; }
+                if (maxs[ir] == -inf) { maxs[ir] = nan; }
+            }
+
+            Print() << std::setprecision(17)
+                    << "QC_AUDIT"
+                    << " label=" << label
+                    << " lev=" << lev
+                    << " step=" << step
+                    << " time=" << time
+                    << " k=" << kk
+                    << " var=" << quantity_name
+                    << " interior_mean=" << interior_mean;
+            for (int ir = 0; ir < nregions; ++ir) {
+                Print() << " " << region_names[ir] << "_min=" << mins[ir]
+                        << " " << region_names[ir] << "_max=" << maxs[ir];
+            }
+            Print() << "\n";
+        }
+    }
+}
+
+void
+ERF::AuditQCChanges (int lev, const MultiFab& field, const MultiFab& rho,
+                     const std::string& label, Real time) const
+{
+    if (!audit_qc_changes) { return; }
+    erf_audit_qc_changes(Geom(lev), field, rho, label, lev, istep[lev], time, 5,
+                         "RhoQ2_over_rho");
+}
 
 Real ERF::startCPUTime        = zero;
 Real ERF::previousCPUTimeUsed = zero;
@@ -2413,6 +2536,7 @@ ERF::ReadParameters ()
 
         // Check for NaNs?
         pp.query("check_for_nans", check_for_nans);
+        pp.query("audit_qc_changes", audit_qc_changes);
 
         // Frequency of diagnostic output
         pp.query("sum_interval", sum_interval);

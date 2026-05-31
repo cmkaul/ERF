@@ -119,10 +119,12 @@ ERF::timeStep (int lev, Real time, int /*iteration*/)
     //
     if (lev == 0) {
         FillPatchCrseLevel(lev, time, {&S_new, &U_new, &V_new, &W_new});
+        AuditQCChanges(lev, S_new, S_new, "after_FillPatchCrseLevel_start_timestep", time);
     } else if (lev < finest_level) {
         FillPatchFineLevel(lev, time, {&S_new, &U_new, &V_new, &W_new},
                            {&S_new, &rU_new[lev], &rV_new[lev], &rW_new[lev]},
                            base_state[lev], base_state[lev]);
+        AuditQCChanges(lev, S_new, S_new, "after_FillPatchFineLevel_start_timestep", time);
     }
 
     if (regrid_int > 0)  // We may need to regrid

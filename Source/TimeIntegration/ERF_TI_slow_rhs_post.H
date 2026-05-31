@@ -56,6 +56,7 @@
                           fine_geom, solverChoice, m_SurfaceLayer, domain_bcs_type_d, domain_bcs_type,
                           z_phys_nd[level], z_phys_cc[level], ax[level], ay[level], az[level],
                           detJ_cc[level], new_detJ, stretched_dz_d[level], mapfac[level], EBFactory(level),
+                          audit_qc_changes, istep[level], old_stage_time,
 #if defined(ERF_USE_NETCDF)
                           moist_set_rhs,
                           start_time+old_stage_time,

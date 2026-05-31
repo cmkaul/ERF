@@ -1093,6 +1093,9 @@ ERF::init_from_wrfinput (int lev,
                            l_rdOcp, lmask_lev[lev][0], use_moist);
         }
     } // lev == 0 && nc_low_file exists
+
+    AuditQCChanges(lev, lev_new[Vars::cons], lev_new[Vars::cons],
+                   "after_init_from_wrfinput", t_new[lev]);
 }
 
 
@@ -1422,5 +1425,6 @@ init_terrain_from_wrfinput (int /*lev*/,
             });
         } // tile includes zlo
     } // mfi
+
 }
 #endif // ERF_USE_NETCDF

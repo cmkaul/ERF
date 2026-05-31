@@ -6,6 +6,7 @@
 #include "AMReX_YAFluxRegister.H"
 #include "AMReX_MultiCutFab.H"
 #include "AMReX_EBMultiFabUtil.H"
+#include <string>
 
 #include "ERF_DataStruct.H"
 #include "ERF_IndexDefines.H"
@@ -18,6 +19,15 @@
 #include "ERF_TileNoZ.H"
 #include "ERF_EB.H"
 #include "ERF_ReadBndryPlanes.H"
+
+void erf_audit_qc_changes (const amrex::Geometry& geom,
+                           const amrex::MultiFab& field,
+                           const amrex::MultiFab& rho,
+                           const std::string& label,
+                           int lev, int step,
+                           amrex::Real time,
+                           int ring_width,
+                           const std::string& quantity_name);
 
 void erf_make_tau_terms (int level, int nrk,
                          const amrex::Vector<amrex::BCRec>& domain_bcs_type,
@@ -147,6 +157,9 @@ void erf_slow_rhs_post (int level, int finest_level, int nrk,
                        amrex::Gpu::DeviceVector<amrex::Real>& stretched_dz_d,
                        amrex::Vector<std::unique_ptr<amrex::MultiFab>>& mapfac,
                        amrex::EBFArrayBoxFactory const& ebfact,
+                       bool audit_qc_changes,
+                       int step,
+                       amrex::Real audit_time,
 #if defined(ERF_USE_NETCDF)
                        const bool& moist_zero,
                        const amrex::Real& old_stage_time_total,
