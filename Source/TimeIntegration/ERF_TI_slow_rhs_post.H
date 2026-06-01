@@ -152,8 +152,12 @@
 
         // Apply boundary conditions on all the state variables that have been updated
         // in both the fast and slow integrators
+        erf_audit_cons_ghost(fine_geom, S_new[IntVars::cons], "pre_apply_bcs_ghost",
+                             level, istep[level], new_stage_time);
         apply_bcs(S_new, new_stage_time, S_new[IntVars::cons].nGrow(), S_new[IntVars::xmom].nGrow(),
                   fast_only=false, vel_and_mom_synced=false);
+        erf_audit_cons_ghost(fine_geom, S_new[IntVars::cons], "post_apply_bcs_ghost",
+                             level, istep[level], new_stage_time);
 
         if (solverChoice.moisture_tight_coupling) {
             // TODO: need iteration var for lagrangian microphysics

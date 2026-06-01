@@ -1,4 +1,5 @@
 #include "ERF_SatAdj.H"
+#include "ERF_QCAudit.H"
 
 using namespace amrex;
 
@@ -77,5 +78,20 @@ void SatAdj::Copy_State_to_Micro (const MultiFab& cons_in)
             pres_array(i,j,k)  = getPgivenRTh(rhoTheta, qv) * Real(0.01);
         });
     }
-}
 
+    if (erf_qc_audit_enabled()) {
+        const int lev = erf_qc_audit_level();
+        const int step = erf_qc_audit_step();
+        const Real time = erf_qc_audit_time();
+        erf_audit_ring_mf(m_geom, *mic_fab_vars[MicVar_SatAdj::qv], 0,
+                          "satadj_after_Copy_State_to_Micro_qv", lev, step, time, 5, "qv");
+        erf_audit_ring_mf(m_geom, *mic_fab_vars[MicVar_SatAdj::qc], 0,
+                          "satadj_after_Copy_State_to_Micro_qc", lev, step, time, 5, "qc");
+        erf_audit_ring_mf(m_geom, *mic_fab_vars[MicVar_SatAdj::theta], 0,
+                          "satadj_after_Copy_State_to_Micro_theta", lev, step, time, 5, "theta");
+        erf_audit_ring_mf(m_geom, *mic_fab_vars[MicVar_SatAdj::tabs], 0,
+                          "satadj_after_Copy_State_to_Micro_tabs", lev, step, time, 5, "tabs");
+        erf_audit_ring_mf(m_geom, *mic_fab_vars[MicVar_SatAdj::pres], 0,
+                          "satadj_after_Copy_State_to_Micro_pres", lev, step, time, 5, "pres");
+    }
+}

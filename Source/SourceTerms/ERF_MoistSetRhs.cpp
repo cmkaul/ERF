@@ -2,6 +2,7 @@
 
 #include <ERF_SrcHeaders.H>
 #include <ERF_Utils.H>
+#include <ERF_QCAudit.H>
 
 using namespace amrex;
 
@@ -28,7 +29,12 @@ moist_set_rhs (const Geometry& geom,
                Vector<Vector<FArrayBox>>& bdy_data_xhi,
                Vector<Vector<FArrayBox>>& bdy_data_ylo,
                Vector<Vector<FArrayBox>>& bdy_data_yhi,
-               std::unique_ptr<ReadBndryPlanes>& m_r2d)
+               std::unique_ptr<ReadBndryPlanes>& m_r2d,
+               bool audit_qc_changes,
+               const Array4<Real>& audit_dqv_equiv,
+               const Array4<Real>& audit_qv_target,
+               const Array4<Real>& audit_qv_model,
+               const Array4<Real>& audit_qv_target_minus_model)
 {
     // HACK HACK HACK
     // Get bndry data
@@ -212,12 +218,54 @@ moist_set_rhs (const Geometry& geom,
                             tbx_xlo, tbx_xhi,
                             tbx_ylo, tbx_yhi,
                             ng_vect);
+    FArrayBox rhs_qv_before;
+    if (audit_qc_changes) {
+        rhs_qv_before.resize(tbx, 1, The_Async_Arena());
+        const Array4<Real> rhs_before_arr = rhs_qv_before.array();
+        ParallelFor(tbx, [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept
+        {
+            rhs_before_arr(i,j,k) = cell_rhs(i,j,k,RhoQ1_comp);
+        });
+    }
+
     realbdy_compute_relaxation(RhoQ1_comp, 1,
                                width, dx, ProbLo, ProbHi, F1, domain,
                                tbx_xlo , tbx_xhi , tbx_ylo , tbx_yhi ,
                                arr_xlo , arr_xhi , arr_ylo , arr_yhi ,
                                u_xlo, u_xhi, v_xlo, v_xhi, v_ylo, v_yhi,
                                new_cons, cell_rhs, do_upwind);
+
+    if (audit_qc_changes) {
+        const Array4<Real> rhs_before_arr = rhs_qv_before.array();
+        auto fill_audit = [=] AMREX_GPU_DEVICE (int i, int j, int k, Real target_rhoqv) noexcept
+        {
+            const Real rho = new_cons(i,j,k,Rho_comp);
+            const Real qv_model = new_cons(i,j,k,RhoQ1_comp) / rho;
+            const Real qv_target = target_rhoqv / rho;
+            audit_dqv_equiv(i,j,k) = dt * (cell_rhs(i,j,k,RhoQ1_comp) - rhs_before_arr(i,j,k)) / rho;
+            audit_qv_target(i,j,k) = qv_target;
+            audit_qv_model(i,j,k) = qv_model;
+            audit_qv_target_minus_model(i,j,k) = qv_target - qv_model;
+        };
+        ParallelFor(tbx_xlo, tbx_xhi,
+        [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept
+        {
+            fill_audit(i,j,k,arr_xlo(i,j,k));
+        },
+        [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept
+        {
+            fill_audit(i,j,k,arr_xhi(i,j,k));
+        });
+        ParallelFor(tbx_ylo, tbx_yhi,
+        [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept
+        {
+            fill_audit(i,j,k,arr_ylo(i,j,k));
+        },
+        [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept
+        {
+            fill_audit(i,j,k,arr_yhi(i,j,k));
+        });
+    }
 
     /*
     // UNIT TEST DEBUG

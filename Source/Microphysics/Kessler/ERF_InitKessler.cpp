@@ -1,6 +1,7 @@
 #include <AMReX_GpuContainers.H>
 #include "ERF_Kessler.H"
 #include "ERF_IndexDefines.H"
+#include "ERF_QCAudit.H"
 #include "ERF_EOS.H"
 #include "ERF_TileNoZ.H"
 
@@ -96,5 +97,23 @@ void Kessler::Copy_State_to_Micro (const MultiFab& cons_in)
             pres_array(i,j,k)  = getPgivenRTh(states_array(i,j,k,RhoTheta_comp), qv_array(i,j,k)) * Real(0.01);
         });
     }
-}
 
+    if (erf_qc_audit_enabled()) {
+        const int lev = erf_qc_audit_level();
+        const int step = erf_qc_audit_step();
+        const Real time = erf_qc_audit_time();
+        erf_audit_cons_ghost(m_geom, cons_in, "copy_state_to_micro_ghost", lev, step, time);
+        erf_audit_ring_mf(m_geom, *mic_fab_vars[MicVar_Kess::qv], 0,
+                          "kessler_after_Copy_State_to_Micro_qv", lev, step, time, 5, "qv");
+        erf_audit_ring_mf(m_geom, *mic_fab_vars[MicVar_Kess::qcl], 0,
+                          "kessler_after_Copy_State_to_Micro_qc", lev, step, time, 5, "qc");
+        erf_audit_ring_mf(m_geom, *mic_fab_vars[MicVar_Kess::qp], 0,
+                          "kessler_after_Copy_State_to_Micro_qp", lev, step, time, 5, "qp");
+        erf_audit_ring_mf(m_geom, *mic_fab_vars[MicVar_Kess::theta], 0,
+                          "kessler_after_Copy_State_to_Micro_theta", lev, step, time, 5, "theta");
+        erf_audit_ring_mf(m_geom, *mic_fab_vars[MicVar_Kess::tabs], 0,
+                          "kessler_after_Copy_State_to_Micro_tabs", lev, step, time, 5, "tabs");
+        erf_audit_ring_mf(m_geom, *mic_fab_vars[MicVar_Kess::pres], 0,
+                          "kessler_after_Copy_State_to_Micro_pres", lev, step, time, 5, "pres");
+    }
+}

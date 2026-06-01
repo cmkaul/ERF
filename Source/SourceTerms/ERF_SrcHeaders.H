@@ -140,7 +140,12 @@ moist_set_rhs (const amrex::Geometry& geom,
                amrex::Vector<amrex::Vector<amrex::FArrayBox>>& bdy_data_xhi,
                amrex::Vector<amrex::Vector<amrex::FArrayBox>>& bdy_data_ylo,
                amrex::Vector<amrex::Vector<amrex::FArrayBox>>& bdy_data_yhi,
-               std::unique_ptr<ReadBndryPlanes>& m_r2d);
+               std::unique_ptr<ReadBndryPlanes>& m_r2d,
+               bool audit_qc_changes,
+               const amrex::Array4<amrex::Real>& audit_dqv_equiv,
+               const amrex::Array4<amrex::Real>& audit_qv_target,
+               const amrex::Array4<amrex::Real>& audit_qv_model,
+               const amrex::Array4<amrex::Real>& audit_qv_target_minus_model);
 #endif
 
 void ApplySpongeZoneBCsForCC (const SpongeChoice& spongeChoice,

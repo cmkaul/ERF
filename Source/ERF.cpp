@@ -8,9 +8,13 @@
 
 #include <memory>
 #include <array>
+#include <algorithm>
 #include <iomanip>
 #include <limits>
+#include <climits>
+#include <cmath>
 
+#include "AMReX_BoxIterator.H"
 #include "ERF_EOS.H"
 #include "ERF.H"
 #include "AMReX_buildInfo.H"
@@ -21,6 +25,7 @@
 #include "AMReX_EB2_IF_Plane.H"
 
 #include "ERF_EpochTime.H"
+#include "ERF_QCAudit.H"
 #include "ERF_Utils.H"
 #include "ERF_TerrainMetrics.H"
 #include "ERF_EBIFTerrain.H"
@@ -32,6 +37,785 @@
 #endif
 
 using namespace amrex;
+
+namespace {
+int qc_audit_context_lev = -1;
+int qc_audit_context_step = -1;
+Real qc_audit_context_time = std::numeric_limits<Real>::quiet_NaN();
+}
+
+bool
+erf_qc_audit_enabled ()
+{
+#ifdef ERF_QC_AUDIT
+    static bool initialized = false;
+    static bool enabled = false;
+    if (!initialized) {
+        ParmParse pp("erf");
+        pp.query("audit_qc_changes", enabled);
+        pp.query("qc_audit", enabled);
+        initialized = true;
+    }
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+bool
+erf_qc_audit_point_stencil_enabled ()
+{
+#ifdef ERF_QC_AUDIT
+    static bool initialized = false;
+    static bool enabled = false;
+    if (!initialized) {
+        ParmParse pp("erf");
+        pp.query("qc_audit_point_stencil", enabled);
+        initialized = true;
+    }
+    return enabled && erf_qc_audit_enabled();
+#else
+    return false;
+#endif
+}
+
+bool
+erf_qc_audit_should_log (int step)
+{
+#ifdef ERF_QC_AUDIT
+    static bool initialized = false;
+    static int interval = 1;
+    if (!initialized) {
+        ParmParse pp("erf");
+        pp.query("qc_audit_interval", interval);
+        interval = std::max(1, interval);
+        initialized = true;
+    }
+    return erf_qc_audit_enabled() && (step < 0 || step % interval == 0);
+#else
+    amrex::ignore_unused(step);
+    return false;
+#endif
+}
+
+void
+erf_set_qc_audit_context (int lev, int step, Real time)
+{
+    qc_audit_context_lev = lev;
+    qc_audit_context_step = step;
+    qc_audit_context_time = time;
+}
+
+int erf_qc_audit_level () { return qc_audit_context_lev; }
+int erf_qc_audit_step () { return qc_audit_context_step; }
+Real erf_qc_audit_time () { return qc_audit_context_time; }
+
+void
+erf_audit_ring_mf (const Geometry& geom, const MultiFab& mf, int comp,
+                   const std::string& label, int lev, int step, Real time,
+                   int ring_width, const std::string& quantity_name)
+{
+    erf_audit_ring_mf(geom, mf, comp, label, lev, step, time, ring_width,
+                      quantity_name, "QC_AUDIT_MICRO");
+}
+
+void
+erf_audit_ring_mf (const Geometry& geom, const MultiFab& mf, int comp,
+                   const std::string& label, int lev, int step, Real time,
+                   int ring_width, const std::string& quantity_name,
+                   const std::string& audit_tag)
+{
+#ifndef ERF_QC_AUDIT
+    amrex::ignore_unused(geom, mf, comp, label, lev, step, time, ring_width, quantity_name, audit_tag);
+    return;
+#else
+    if (!erf_qc_audit_should_log(step) || comp < 0 || mf.nComp() <= comp) { return; }
+
+    constexpr int nregions = 5;
+    constexpr int nk_audit = 6;
+    const std::array<int, nk_audit> audit_k_offsets{{0, 1, 2, 5, 10, 20}};
+    static bool initialized = false;
+    static int audit_kmax = 0;
+    if (!initialized) {
+        ParmParse pp("erf");
+        pp.query("qc_audit_kmax", audit_kmax);
+        initialized = true;
+    }
+
+    const Box& domain = geom.Domain();
+    const int ilo = domain.smallEnd(0);
+    const int ihi = domain.bigEnd(0);
+    const int jlo = domain.smallEnd(1);
+    const int jhi = domain.bigEnd(1);
+    const int klo = domain.smallEnd(2);
+    const int khi = domain.bigEnd(2);
+    const int nx = domain.length(0);
+    const int ny = domain.length(1);
+    const int w = std::max(1, std::min(ring_width, std::min(nx, ny)));
+    const Real inf = std::numeric_limits<Real>::infinity();
+    const Real nan = std::numeric_limits<Real>::quiet_NaN();
+    const Long no_loc = static_cast<Long>(INT_MAX);
+    const std::array<const char*, nregions> region_names{{"ring", "xlo", "xhi", "ylo", "yhi"}};
+
+    for (int ik = 0; ik < nk_audit; ++ik) {
+        const int kk = klo + audit_k_offsets[ik];
+        if (audit_k_offsets[ik] > audit_kmax || kk > khi) { continue; }
+        ReduceOps<ReduceOpSum, ReduceOpSum,
+                  ReduceOpMin, ReduceOpMin, ReduceOpMin, ReduceOpMin, ReduceOpMin, ReduceOpMin,
+                  ReduceOpMax, ReduceOpMax, ReduceOpMax, ReduceOpMax, ReduceOpMax, ReduceOpMax> reduce_op;
+        ReduceData<Real, Long,
+                   Real, Real, Real, Real, Real, Real,
+                   Real, Real, Real, Real, Real, Real> reduce_data(reduce_op);
+        using ReduceTuple = typename decltype(reduce_data)::Type;
+
+        for (MFIter mfi(mf, TilingIfNotGPU()); mfi.isValid(); ++mfi) {
+            const Box& bx = mfi.tilebox();
+            const Array4<const Real>& arr = mf.const_array(mfi);
+
+            reduce_op.eval(bx, reduce_data,
+            [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept -> ReduceTuple
+            {
+                if (k != kk) {
+                    return {zero, 0L,
+                            inf, inf, inf, inf, inf, inf,
+                            -inf, -inf, -inf, -inf, -inf, -inf};
+                }
+
+                const Real val = arr(i,j,k,comp);
+                const bool in_xlo = (i < ilo + w);
+                const bool in_xhi = (i > ihi - w);
+                const bool in_ylo = (j < jlo + w);
+                const bool in_yhi = (j > jhi - w);
+                const bool in_ring = in_xlo || in_xhi || in_ylo || in_yhi;
+                const bool in_interior = (i >= ilo + w) && (i <= ihi - w) &&
+                                         (j >= jlo + w) && (j <= jhi - w);
+
+                return {
+                    in_interior ? val : zero,
+                    in_interior ? 1L  : 0L,
+                    in_interior ? val : inf,
+                    in_ring ? val : inf,
+                    in_xlo  ? val : inf,
+                    in_xhi  ? val : inf,
+                    in_ylo  ? val : inf,
+                    in_yhi  ? val : inf,
+                    in_interior ? val : -inf,
+                    in_ring ? val : -inf,
+                    in_xlo  ? val : -inf,
+                    in_xhi  ? val : -inf,
+                    in_ylo  ? val : -inf,
+                    in_yhi  ? val : -inf
+                };
+            });
+        }
+
+        auto hv = reduce_data.value(reduce_op);
+        Real interior_sum = get<0>(hv);
+        Long interior_count = get<1>(hv);
+        Real interior_min = get<2>(hv);
+        Real mins[nregions] = {get<3>(hv), get<4>(hv), get<5>(hv), get<6>(hv), get<7>(hv)};
+        Real interior_max = get<8>(hv);
+        Real maxs[nregions] = {get<9>(hv), get<10>(hv), get<11>(hv), get<12>(hv), get<13>(hv)};
+
+        ParallelDescriptor::ReduceRealSum(interior_sum);
+        ParallelDescriptor::ReduceLongSum(interior_count);
+        ParallelDescriptor::ReduceRealMin(interior_min);
+        ParallelDescriptor::ReduceRealMax(interior_max);
+        ParallelDescriptor::ReduceRealMin(mins, nregions);
+        ParallelDescriptor::ReduceRealMax(maxs, nregions);
+
+        const Real interior_mean = (interior_count > 0) ? interior_sum / static_cast<Real>(interior_count) : nan;
+        if (interior_min == inf) { interior_min = nan; }
+        if (interior_max == -inf) { interior_max = nan; }
+        for (int ir = 0; ir < nregions; ++ir) {
+            if (mins[ir] == inf) { mins[ir] = nan; }
+            if (maxs[ir] == -inf) { maxs[ir] = nan; }
+        }
+
+        Long max_i = no_loc;
+        Long max_j = no_loc;
+        Long max_k = no_loc;
+        if (maxs[0] != -inf && maxs[0] == maxs[0]) {
+            const Real ring_max = maxs[0];
+            ReduceOps<ReduceOpMin, ReduceOpMin, ReduceOpMin> loc_reduce_op;
+            ReduceData<Long, Long, Long> loc_reduce_data(loc_reduce_op);
+            using LocTuple = typename decltype(loc_reduce_data)::Type;
+
+            for (MFIter mfi(mf, TilingIfNotGPU()); mfi.isValid(); ++mfi) {
+                const Box& bx = mfi.tilebox();
+                const Array4<const Real>& arr = mf.const_array(mfi);
+
+                loc_reduce_op.eval(bx, loc_reduce_data,
+                [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept -> LocTuple
+                {
+                    const bool in_xlo = (i < ilo + w);
+                    const bool in_xhi = (i > ihi - w);
+                    const bool in_ylo = (j < jlo + w);
+                    const bool in_yhi = (j > jhi - w);
+                    const bool is_max = (k == kk) && (in_xlo || in_xhi || in_ylo || in_yhi) &&
+                                        (arr(i,j,k,comp) == ring_max);
+                    return {is_max ? static_cast<Long>(i) : no_loc,
+                            is_max ? static_cast<Long>(j) : no_loc,
+                            is_max ? static_cast<Long>(k) : no_loc};
+                });
+            }
+
+            auto loc = loc_reduce_data.value(loc_reduce_op);
+            max_i = get<0>(loc);
+            max_j = get<1>(loc);
+            max_k = get<2>(loc);
+            ParallelDescriptor::ReduceLongMin(max_i);
+            ParallelDescriptor::ReduceLongMin(max_j);
+            ParallelDescriptor::ReduceLongMin(max_k);
+        }
+
+        const char* max_region = "none";
+        if (max_i != no_loc) {
+            if (max_i < ilo + w) {
+                max_region = "xlo";
+            } else if (max_i > ihi - w) {
+                max_region = "xhi";
+            } else if (max_j < jlo + w) {
+                max_region = "ylo";
+            } else if (max_j > jhi - w) {
+                max_region = "yhi";
+            }
+        }
+
+        Print() << std::setprecision(17)
+                << audit_tag
+                << " label=" << label
+                << " lev=" << lev
+                << " step=" << step
+                << " time=" << time
+                << " k=" << kk
+                << " var=" << quantity_name
+                << " interior_min=" << interior_min
+                << " interior_mean=" << interior_mean
+                << " interior_max=" << interior_max;
+        for (int ir = 0; ir < nregions; ++ir) {
+            Print() << " " << region_names[ir] << "_min=" << mins[ir]
+                    << " " << region_names[ir] << "_max=" << maxs[ir];
+        }
+        Print() << " max_i=" << max_i
+                << " max_j=" << max_j
+                << " max_k=" << max_k
+                << " max_region=" << max_region
+                << "\n";
+    }
+#endif
+}
+
+void
+erf_audit_mf_ghost (const Geometry& geom, const MultiFab& mf, int comp,
+                    const std::string& label, int lev, int step, Real time,
+                    const std::string& quantity_name)
+{
+#ifndef ERF_QC_AUDIT
+    amrex::ignore_unused(geom, mf, comp, label, lev, step, time, quantity_name);
+    return;
+#else
+    if (!erf_qc_audit_should_log(step) || comp < 0 || mf.nComp() <= comp) { return; }
+
+    constexpr int nfaces = 5;
+    constexpr int nk_audit = 6;
+    const std::array<const char*, nfaces> face_names{{"xlo", "xhi", "ylo", "yhi", "zlo"}};
+    const std::array<int, nk_audit> audit_k_offsets{{0, 1, 2, 5, 10, 20}};
+    static bool initialized = false;
+    static int audit_kmax = 0;
+    if (!initialized) {
+        ParmParse pp("erf");
+        pp.query("qc_audit_kmax", audit_kmax);
+        initialized = true;
+    }
+
+    const Box& domain = geom.Domain();
+    const int ilo = domain.smallEnd(0);
+    const int ihi = domain.bigEnd(0);
+    const int jlo = domain.smallEnd(1);
+    const int jhi = domain.bigEnd(1);
+    const int klo = domain.smallEnd(2);
+    const int khi = domain.bigEnd(2);
+    const IntVect ng = mf.nGrowVect();
+    const Real inf = std::numeric_limits<Real>::infinity();
+    const Real nan = std::numeric_limits<Real>::quiet_NaN();
+    const Long no_loc = static_cast<Long>(INT_MAX);
+
+    for (int iface = 0; iface < nfaces; ++iface) {
+        for (int ik = 0; ik < nk_audit; ++ik) {
+            int kk = klo + audit_k_offsets[ik];
+            if (iface == 4) {
+                if (ng[2] <= 0 || ik > 0) { continue; }
+                kk = klo - 1;
+            } else if (audit_k_offsets[ik] > audit_kmax || kk > khi) {
+                continue;
+            }
+
+            ReduceOps<ReduceOpSum, ReduceOpSum, ReduceOpMin, ReduceOpMax,
+                      ReduceOpMin, ReduceOpMin, ReduceOpMin,
+                      ReduceOpMin, ReduceOpMin, ReduceOpMin> reduce_op;
+            ReduceData<Real, Long, Real, Real, Long, Long, Long, Long, Long, Long> reduce_data(reduce_op);
+            using ReduceTuple = typename decltype(reduce_data)::Type;
+
+            for (MFIter mfi(mf, TilingIfNotGPU()); mfi.isValid(); ++mfi) {
+                const Box& bx = mfi.growntilebox(ng);
+                const Array4<const Real>& arr = mf.const_array(mfi);
+
+                reduce_op.eval(bx, reduce_data,
+                [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept -> ReduceTuple
+                {
+                    bool in_face = false;
+                    if (iface == 0) {
+                        in_face = (i < ilo) && (j >= jlo) && (j <= jhi) && (k == kk);
+                    } else if (iface == 1) {
+                        in_face = (i > ihi) && (j >= jlo) && (j <= jhi) && (k == kk);
+                    } else if (iface == 2) {
+                        in_face = (j < jlo) && (i >= ilo) && (i <= ihi) && (k == kk);
+                    } else if (iface == 3) {
+                        in_face = (j > jhi) && (i >= ilo) && (i <= ihi) && (k == kk);
+                    } else {
+                        in_face = (k == kk) && (i >= ilo) && (i <= ihi) && (j >= jlo) && (j <= jhi);
+                    }
+
+                    const Real val = in_face ? arr(i,j,k,comp) : zero;
+                    return {in_face ? val : zero,
+                            in_face ? 1L : 0L,
+                            in_face ? val : inf,
+                            in_face ? val : -inf,
+                            in_face ? static_cast<Long>(i) : no_loc,
+                            in_face ? static_cast<Long>(j) : no_loc,
+                            in_face ? static_cast<Long>(k) : no_loc,
+                            no_loc,
+                            no_loc,
+                            no_loc};
+                });
+            }
+
+            auto hv = reduce_data.value(reduce_op);
+            Real sum = get<0>(hv);
+            Long count = get<1>(hv);
+            Real vmin = get<2>(hv);
+            Real vmax = get<3>(hv);
+            Long max_i = get<4>(hv);
+            Long max_j = get<5>(hv);
+            Long max_k = get<6>(hv);
+            Long min_i = get<7>(hv);
+            Long min_j = get<8>(hv);
+            Long min_k = get<9>(hv);
+
+            ParallelDescriptor::ReduceRealSum(sum);
+            ParallelDescriptor::ReduceLongSum(count);
+            ParallelDescriptor::ReduceRealMin(vmin);
+            ParallelDescriptor::ReduceRealMax(vmax);
+
+            if (count == 0) { continue; }
+
+            const Real mean = sum / static_cast<Real>(count);
+            const Real global_vmax = vmax;
+            const Real global_vmin = vmin;
+            ReduceOps<ReduceOpMin, ReduceOpMin, ReduceOpMin> loc_reduce_op;
+            ReduceData<Long, Long, Long> loc_reduce_data(loc_reduce_op);
+            using LocTuple = typename decltype(loc_reduce_data)::Type;
+            for (MFIter mfi(mf, TilingIfNotGPU()); mfi.isValid(); ++mfi) {
+                const Box& bx = mfi.growntilebox(ng);
+                const Array4<const Real>& arr = mf.const_array(mfi);
+                loc_reduce_op.eval(bx, loc_reduce_data,
+                [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept -> LocTuple
+                {
+                    bool in_face = false;
+                    if (iface == 0) {
+                        in_face = (i < ilo) && (j >= jlo) && (j <= jhi) && (k == kk);
+                    } else if (iface == 1) {
+                        in_face = (i > ihi) && (j >= jlo) && (j <= jhi) && (k == kk);
+                    } else if (iface == 2) {
+                        in_face = (j < jlo) && (i >= ilo) && (i <= ihi) && (k == kk);
+                    } else if (iface == 3) {
+                        in_face = (j > jhi) && (i >= ilo) && (i <= ihi) && (k == kk);
+                    } else {
+                        in_face = (k == kk) && (i >= ilo) && (i <= ihi) && (j >= jlo) && (j <= jhi);
+                    }
+                    const bool is_max = in_face && (arr(i,j,k,comp) == global_vmax);
+                    return {is_max ? static_cast<Long>(i) : no_loc,
+                            is_max ? static_cast<Long>(j) : no_loc,
+                            is_max ? static_cast<Long>(k) : no_loc};
+                });
+            }
+            auto loc = loc_reduce_data.value(loc_reduce_op);
+            max_i = get<0>(loc);
+            max_j = get<1>(loc);
+            max_k = get<2>(loc);
+            ParallelDescriptor::ReduceLongMin(max_i);
+            ParallelDescriptor::ReduceLongMin(max_j);
+            ParallelDescriptor::ReduceLongMin(max_k);
+
+            ReduceOps<ReduceOpMin, ReduceOpMin, ReduceOpMin> min_loc_reduce_op;
+            ReduceData<Long, Long, Long> min_loc_reduce_data(min_loc_reduce_op);
+            using MinLocTuple = typename decltype(min_loc_reduce_data)::Type;
+            for (MFIter mfi(mf, TilingIfNotGPU()); mfi.isValid(); ++mfi) {
+                const Box& bx = mfi.growntilebox(ng);
+                const Array4<const Real>& arr = mf.const_array(mfi);
+                min_loc_reduce_op.eval(bx, min_loc_reduce_data,
+                [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept -> MinLocTuple
+                {
+                    bool in_face = false;
+                    if (iface == 0) {
+                        in_face = (i < ilo) && (j >= jlo) && (j <= jhi) && (k == kk);
+                    } else if (iface == 1) {
+                        in_face = (i > ihi) && (j >= jlo) && (j <= jhi) && (k == kk);
+                    } else if (iface == 2) {
+                        in_face = (j < jlo) && (i >= ilo) && (i <= ihi) && (k == kk);
+                    } else if (iface == 3) {
+                        in_face = (j > jhi) && (i >= ilo) && (i <= ihi) && (k == kk);
+                    } else {
+                        in_face = (k == kk) && (i >= ilo) && (i <= ihi) && (j >= jlo) && (j <= jhi);
+                    }
+                    const bool is_min = in_face && (arr(i,j,k,comp) == global_vmin);
+                    return {is_min ? static_cast<Long>(i) : no_loc,
+                            is_min ? static_cast<Long>(j) : no_loc,
+                            is_min ? static_cast<Long>(k) : no_loc};
+                });
+            }
+            auto min_loc = min_loc_reduce_data.value(min_loc_reduce_op);
+            min_i = get<0>(min_loc);
+            min_j = get<1>(min_loc);
+            min_k = get<2>(min_loc);
+            ParallelDescriptor::ReduceLongMin(min_i);
+            ParallelDescriptor::ReduceLongMin(min_j);
+            ParallelDescriptor::ReduceLongMin(min_k);
+
+            if (vmin == inf) { vmin = nan; }
+            if (vmax == -inf) { vmax = nan; }
+            Print() << std::setprecision(17)
+                    << "QC_AUDIT_GHOST"
+                    << " label=" << label
+                    << " face=" << face_names[iface]
+                    << " lev=" << lev
+                    << " step=" << step
+                    << " time=" << time
+                    << " k=" << kk
+                    << " var=" << quantity_name
+                    << " ghost_min=" << vmin
+                    << " ghost_mean=" << mean
+                    << " ghost_max=" << vmax
+                    << " min_i=" << min_i
+                    << " min_j=" << min_j
+                    << " min_k=" << min_k
+                    << " max_i=" << max_i
+                    << " max_j=" << max_j
+                    << " max_k=" << max_k
+                    << "\n";
+        }
+    }
+#endif
+}
+
+void
+erf_audit_warn_if_gt (const Geometry& geom, const MultiFab& mf, int comp,
+                      const std::string& label, int lev, int step, Real time,
+                      Real threshold)
+{
+#ifndef ERF_QC_AUDIT
+    amrex::ignore_unused(geom, mf, comp, label, lev, step, time, threshold);
+    return;
+#else
+    if (!erf_qc_audit_should_log(step) || comp < 0 || mf.nComp() <= comp) { return; }
+
+    const Box& domain = geom.Domain();
+    const Real inf = std::numeric_limits<Real>::infinity();
+    const Long no_loc = static_cast<Long>(INT_MAX);
+
+    ReduceOps<ReduceOpMax, ReduceOpMin, ReduceOpMin, ReduceOpMin> reduce_op;
+    ReduceData<Real, Long, Long, Long> reduce_data(reduce_op);
+    using ReduceTuple = typename decltype(reduce_data)::Type;
+    for (MFIter mfi(mf, TilingIfNotGPU()); mfi.isValid(); ++mfi) {
+        const Box& bx = mfi.tilebox() & domain;
+        const Array4<const Real>& arr = mf.const_array(mfi);
+        reduce_op.eval(bx, reduce_data,
+        [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept -> ReduceTuple
+        {
+            const Real val = arr(i,j,k,comp);
+            const bool bad = val > threshold;
+            return {val,
+                    bad ? static_cast<Long>(i) : no_loc,
+                    bad ? static_cast<Long>(j) : no_loc,
+                    bad ? static_cast<Long>(k) : no_loc};
+        });
+    }
+
+    auto hv = reduce_data.value(reduce_op);
+    Real vmax = get<0>(hv);
+    Long max_i = get<1>(hv);
+    Long max_j = get<2>(hv);
+    Long max_k = get<3>(hv);
+    ParallelDescriptor::ReduceRealMax(vmax);
+    ParallelDescriptor::ReduceLongMin(max_i);
+    ParallelDescriptor::ReduceLongMin(max_j);
+    ParallelDescriptor::ReduceLongMin(max_k);
+
+    if (vmax > threshold) {
+        Warning("ERF_QC_AUDIT visit-count threshold exceeded");
+        Print() << std::setprecision(17)
+                << "QC_AUDIT_WARNING"
+                << " label=" << label
+                << " lev=" << lev
+                << " step=" << step
+                << " time=" << time
+                << " threshold=" << threshold
+                << " value=" << vmax
+                << " i=" << max_i
+                << " j=" << max_j
+                << " k=" << max_k
+                << "\n";
+    }
+    amrex::ignore_unused(inf);
+#endif
+}
+
+void
+erf_audit_cons_zlo_qc_stencil (const Geometry& geom, const MultiFab& audit,
+                               const std::string& label, int lev, int step, Real time,
+                               int rho_comp, int theta_comp, int qv_comp, int qc_comp,
+                               int qr_comp, int tabs_comp, int pres_comp,
+                               int qsat_comp, int qv_minus_qsat_comp, int qc_over_qv_comp)
+{
+#ifndef ERF_QC_AUDIT
+    amrex::ignore_unused(geom, audit, label, lev, step, time, rho_comp, theta_comp, qv_comp,
+                         qc_comp, qr_comp, tabs_comp, pres_comp, qsat_comp,
+                         qv_minus_qsat_comp, qc_over_qv_comp);
+    return;
+#else
+#if defined(AMREX_USE_GPU)
+    amrex::ignore_unused(geom, audit, label, lev, step, time, rho_comp, theta_comp, qv_comp,
+                         qc_comp, qr_comp, tabs_comp, pres_comp, qsat_comp,
+                         qv_minus_qsat_comp, qc_over_qv_comp);
+    return;
+#else
+    if (!erf_qc_audit_point_stencil_enabled() || !erf_qc_audit_should_log(step) ||
+        audit.nGrowVect()[2] <= 0 || audit.nComp() <= qc_over_qv_comp) {
+        return;
+    }
+
+    const Box& dom = geom.Domain();
+    const int ilo = dom.smallEnd(0);
+    const int ihi = dom.bigEnd(0);
+    const int jlo = dom.smallEnd(1);
+    const int jhi = dom.bigEnd(1);
+    const int klo = dom.smallEnd(2);
+    const int kghost = klo - 1;
+    const IntVect ng = audit.nGrowVect();
+    const Real inf = std::numeric_limits<Real>::infinity();
+    const Real nan = std::numeric_limits<Real>::quiet_NaN();
+    const Long no_loc = static_cast<Long>(INT_MAX);
+
+    auto find_zlo_loc = [&] (bool find_max) -> IntVect {
+        Real local_extreme = find_max ? -inf : inf;
+        for (MFIter mfi(audit); mfi.isValid(); ++mfi) {
+            Box bx = mfi.validbox();
+            bx.grow(ng);
+            bx &= Box(IntVect(ilo, jlo, kghost), IntVect(ihi, jhi, kghost));
+            if (!bx.ok()) { continue; }
+            const Array4<const Real>& arr = audit.const_array(mfi);
+            for (BoxIterator bit(bx); bit.ok(); ++bit) {
+                const IntVect& iv = bit();
+                const Real val = arr(iv[0], iv[1], iv[2], qc_comp);
+                local_extreme = find_max ? std::max(local_extreme, val) : std::min(local_extreme, val);
+            }
+        }
+
+        Real global_extreme = local_extreme;
+        if (find_max) {
+            ParallelDescriptor::ReduceRealMax(global_extreme);
+        } else {
+            ParallelDescriptor::ReduceRealMin(global_extreme);
+        }
+
+        Long loc_i = no_loc;
+        Long loc_j = no_loc;
+        Long loc_k = no_loc;
+        if (global_extreme != inf && global_extreme != -inf) {
+            for (MFIter mfi(audit); mfi.isValid(); ++mfi) {
+                Box bx = mfi.validbox();
+                bx.grow(ng);
+                bx &= Box(IntVect(ilo, jlo, kghost), IntVect(ihi, jhi, kghost));
+                if (!bx.ok()) { continue; }
+                const Array4<const Real>& arr = audit.const_array(mfi);
+                for (BoxIterator bit(bx); bit.ok(); ++bit) {
+                    const IntVect& iv = bit();
+                    if (arr(iv[0], iv[1], iv[2], qc_comp) == global_extreme) {
+                        loc_i = std::min(loc_i, static_cast<Long>(iv[0]));
+                        loc_j = std::min(loc_j, static_cast<Long>(iv[1]));
+                        loc_k = std::min(loc_k, static_cast<Long>(iv[2]));
+                    }
+                }
+            }
+        }
+        ParallelDescriptor::ReduceLongMin(loc_i);
+        ParallelDescriptor::ReduceLongMin(loc_j);
+        ParallelDescriptor::ReduceLongMin(loc_k);
+        return IntVect(static_cast<int>(loc_i), static_cast<int>(loc_j), static_cast<int>(loc_k));
+    };
+
+    auto read_component = [&] (const IntVect& iv, int comp) -> Real {
+        Real val_sum = zero;
+        Long count = 0;
+        for (MFIter mfi(audit); mfi.isValid(); ++mfi) {
+            Box bx = mfi.validbox();
+            bx.grow(ng);
+            if (bx.contains(iv)) {
+                const Array4<const Real>& arr = audit.const_array(mfi);
+                val_sum += arr(iv[0], iv[1], iv[2], comp);
+                count += 1;
+            }
+        }
+        ParallelDescriptor::ReduceRealSum(val_sum);
+        ParallelDescriptor::ReduceLongSum(count);
+        return (count > 0) ? val_sum / static_cast<Real>(count) : nan;
+    };
+
+    auto point_kind = [&] (const IntVect& iv) -> const char* {
+        if (!dom.contains(iv)) { return "ghost"; }
+        const int ring_width = 5;
+        const bool ring = (iv[0] < ilo + ring_width) || (iv[0] > ihi - ring_width) ||
+                          (iv[1] < jlo + ring_width) || (iv[1] > jhi - ring_width);
+        return ring ? "ring" : "interior";
+    };
+
+    auto dump_anchor = [&] (const IntVect& center, const std::string& anchor_name) {
+        if (center[0] == static_cast<int>(no_loc)) { return; }
+        const int di[5] = {0, 1, -1, 0, 0};
+        const int dj[5] = {0, 0, 0, 1, -1};
+        for (int n = 0; n < 5; ++n) {
+            for (int kk = kghost; kk <= klo + 2; ++kk) {
+                IntVect iv(center[0] + di[n], center[1] + dj[n], kk);
+                const Real rho = read_component(iv, rho_comp);
+                const Real theta = read_component(iv, theta_comp);
+                const Real qv = read_component(iv, qv_comp);
+                const Real qc = read_component(iv, qc_comp);
+                const Real qr = read_component(iv, qr_comp);
+                const Real tabs = read_component(iv, tabs_comp);
+                const Real pressure = read_component(iv, pres_comp);
+                const Real qsat = read_component(iv, qsat_comp);
+                const Real qv_minus_qsat = read_component(iv, qv_minus_qsat_comp);
+                const Real qc_over_qv = read_component(iv, qc_over_qv_comp);
+
+                Print() << std::setprecision(17)
+                        << "QC_AUDIT_POINT_STENCIL"
+                        << " label=" << label
+                        << " anchor=zlo_qc_" << anchor_name
+                        << " lev=" << lev
+                        << " step=" << step
+                        << " time=" << time
+                        << " center_i=" << center[0]
+                        << " center_j=" << center[1]
+                        << " center_k=" << center[2]
+                        << " i=" << iv[0]
+                        << " j=" << iv[1]
+                        << " k=" << iv[2]
+                        << " point_kind=" << point_kind(iv)
+                        << " rho=" << rho
+                        << " theta=" << theta
+                        << " T=" << tabs
+                        << " pressure=" << pressure
+                        << " qv=" << qv
+                        << " qc=" << qc
+                        << " qr=" << qr
+                        << " qsat=" << qsat
+                        << " qv_minus_qsat=" << qv_minus_qsat
+                        << " qc_over_qv=" << qc_over_qv
+                        << "\n";
+            }
+        }
+    };
+
+    dump_anchor(find_zlo_loc(false), "min");
+    dump_anchor(find_zlo_loc(true), "max");
+#endif
+#endif
+}
+
+void
+erf_audit_cons_ghost (const Geometry& geom, const MultiFab& cons,
+                      const std::string& label, int lev, int step, Real time)
+{
+#ifndef ERF_QC_AUDIT
+    amrex::ignore_unused(geom, cons, label, lev, step, time);
+    return;
+#else
+    if (!erf_qc_audit_should_log(step) || cons.nComp() <= RhoTheta_comp) { return; }
+
+    constexpr int rho_comp = 0;
+    constexpr int theta_comp = 1;
+    constexpr int qv_comp = 2;
+    constexpr int qc_comp = 3;
+    constexpr int qr_comp = 4;
+    constexpr int tabs_comp = 5;
+    constexpr int pres_comp = 6;
+    constexpr int qsat_comp = 7;
+    constexpr int qv_minus_qsat_comp = 8;
+    constexpr int qc_over_qv_comp = 9;
+    constexpr int ncomp = 10;
+
+    MultiFab audit(cons.boxArray(), cons.DistributionMap(), ncomp, cons.nGrowVect());
+    audit.setVal(0.);
+
+    const bool has_qv = cons.nComp() > RhoQ1_comp;
+    const bool has_qc = cons.nComp() > RhoQ2_comp;
+    const bool has_qr = cons.nComp() > RhoQ3_comp;
+    const IntVect ng = cons.nGrowVect();
+
+    for (MFIter mfi(cons, TilingIfNotGPU()); mfi.isValid(); ++mfi) {
+        const Box& bx = mfi.growntilebox(ng);
+        const Array4<const Real>& cons_arr = cons.const_array(mfi);
+        const Array4<Real>& audit_arr = audit.array(mfi);
+
+        ParallelFor(bx, [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept {
+            const Real rho = cons_arr(i,j,k,Rho_comp);
+            const Real rho_theta = cons_arr(i,j,k,RhoTheta_comp);
+            const bool valid_thermo = (rho > Real(0)) && (rho_theta > Real(0));
+            const Real theta = valid_thermo ? rho_theta / rho : zero;
+            const Real qv = (valid_thermo && has_qv) ? cons_arr(i,j,k,RhoQ1_comp) / rho : zero;
+            const Real qc = (valid_thermo && has_qc) ? cons_arr(i,j,k,RhoQ2_comp) / rho : zero;
+            const Real qr = (valid_thermo && has_qr) ? cons_arr(i,j,k,RhoQ3_comp) / rho : zero;
+            Real tabs = zero;
+            Real pres = zero;
+            Real qsat = zero;
+            if (valid_thermo) {
+                tabs = getTgivenRandRTh(rho, rho_theta, qv);
+                pres = getPgivenRTh(rho_theta, qv) * Real(0.01);
+                if (tabs > Real(0) && pres > Real(0)) {
+                    erf_qsatw(tabs, pres, qsat);
+                }
+            }
+
+            audit_arr(i,j,k,rho_comp) = rho;
+            audit_arr(i,j,k,theta_comp) = theta;
+            audit_arr(i,j,k,qv_comp) = qv;
+            audit_arr(i,j,k,qc_comp) = qc;
+            audit_arr(i,j,k,qr_comp) = qr;
+            audit_arr(i,j,k,tabs_comp) = tabs;
+            audit_arr(i,j,k,pres_comp) = pres;
+            audit_arr(i,j,k,qsat_comp) = qsat;
+            audit_arr(i,j,k,qv_minus_qsat_comp) = qv - qsat;
+            audit_arr(i,j,k,qc_over_qv_comp) = (std::abs(qv) > Real(0)) ? qc / qv : zero;
+        });
+    }
+
+    erf_audit_mf_ghost(geom, audit, rho_comp, label, lev, step, time, "rho");
+    erf_audit_mf_ghost(geom, audit, theta_comp, label, lev, step, time, "theta");
+    erf_audit_mf_ghost(geom, audit, qv_comp, label, lev, step, time, "qv");
+    erf_audit_mf_ghost(geom, audit, qc_comp, label, lev, step, time, "qc");
+    erf_audit_mf_ghost(geom, audit, qr_comp, label, lev, step, time, "qr");
+    erf_audit_mf_ghost(geom, audit, tabs_comp, label, lev, step, time, "T");
+    erf_audit_mf_ghost(geom, audit, pres_comp, label, lev, step, time, "pressure");
+    erf_audit_mf_ghost(geom, audit, qsat_comp, label, lev, step, time, "qsat");
+    erf_audit_mf_ghost(geom, audit, qv_minus_qsat_comp, label, lev, step, time, "qv_minus_qsat");
+    erf_audit_mf_ghost(geom, audit, qc_over_qv_comp, label, lev, step, time, "qc_over_qv");
+    erf_audit_cons_zlo_qc_stencil(geom, audit, label, lev, step, time,
+                                  rho_comp, theta_comp, qv_comp, qc_comp, qr_comp,
+                                  tabs_comp, pres_comp, qsat_comp, qv_minus_qsat_comp,
+                                  qc_over_qv_comp);
+#endif
+}
 
 void
 erf_audit_qc_changes (const Geometry& geom, const MultiFab& field, const MultiFab& rho,
@@ -46,7 +830,7 @@ erf_audit_qc_changes (const Geometry& geom, const MultiFab& field, const MultiFa
     const int jlo = domain.smallEnd(1);
     const int jhi = domain.bigEnd(1);
     const int klo = domain.smallEnd(2);
-    const int khi = std::min(domain.bigEnd(2), klo + 2);
+    const int khi = klo;
     const int nx = domain.length(0);
     const int ny = domain.length(1);
     const int w = std::max(1, std::min(ring_width, std::min(nx, ny)));
@@ -148,9 +932,43 @@ void
 ERF::AuditQCChanges (int lev, const MultiFab& field, const MultiFab& rho,
                      const std::string& label, Real time) const
 {
-    if (!audit_qc_changes) { return; }
-    erf_audit_qc_changes(Geom(lev), field, rho, label, lev, istep[lev], time, 5,
-                         "RhoQ2_over_rho");
+    if (!audit_qc_changes || !erf_qc_audit_should_log(istep[lev])) { return; }
+
+    constexpr int n_audit = 4;
+    MultiFab state_audit(field.boxArray(), field.DistributionMap(), n_audit, 0);
+    state_audit.setVal(0.);
+
+    const bool has_qv = (field.nComp() > RhoQ1_comp);
+    const bool has_qc = (field.nComp() > RhoQ2_comp);
+    const bool has_qp = (field.nComp() > RhoQ3_comp);
+
+    for (MFIter mfi(field, TilingIfNotGPU()); mfi.isValid(); ++mfi) {
+        const Box& bx = mfi.tilebox();
+        const Array4<const Real>& field_arr = field.const_array(mfi);
+        const Array4<const Real>& rho_arr = rho.const_array(mfi);
+        const Array4<Real>& audit_arr = state_audit.array(mfi);
+
+        ParallelFor(bx, [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept {
+            const Real rho_val = rho_arr(i,j,k,Rho_comp);
+            const Real qv = has_qv ? field_arr(i,j,k,RhoQ1_comp) / rho_val : zero;
+            const Real qc = has_qc ? field_arr(i,j,k,RhoQ2_comp) / rho_val : zero;
+            const Real qp = has_qp ? field_arr(i,j,k,RhoQ3_comp) / rho_val : zero;
+
+            audit_arr(i,j,k,0) = qc;
+            audit_arr(i,j,k,1) = qv;
+            audit_arr(i,j,k,2) = qv + qc;
+            audit_arr(i,j,k,3) = qv + qc + qp;
+        });
+    }
+
+    erf_audit_ring_mf(Geom(lev), state_audit, 0, label, lev, istep[lev], time, 5,
+                      "RhoQ2_over_rho", "QC_AUDIT_STATE");
+    erf_audit_ring_mf(Geom(lev), state_audit, 1, label, lev, istep[lev], time, 5,
+                      "RhoQ1_over_rho", "QC_AUDIT_STATE");
+    erf_audit_ring_mf(Geom(lev), state_audit, 2, label, lev, istep[lev], time, 5,
+                      "qt_no_rain", "QC_AUDIT_STATE");
+    erf_audit_ring_mf(Geom(lev), state_audit, 3, label, lev, istep[lev], time, 5,
+                      "qt_all", "QC_AUDIT_STATE");
 }
 
 Real ERF::startCPUTime        = zero;

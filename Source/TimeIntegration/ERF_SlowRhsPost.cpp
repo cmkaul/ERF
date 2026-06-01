@@ -3,6 +3,7 @@
 #include <ERF_TI_slow_headers.H>
 #include <ERF_EBAdvection.H>
 #include <ERF_EBRedistribute.H>
+#include <ERF_QCAudit.H>
 #include <string>
 
 using namespace amrex;
@@ -163,8 +164,6 @@ void erf_slow_rhs_post (int level, int finest_level,
     const BoxArray& ba            = S_data[IntVars::cons].boxArray();
     const DistributionMapping& dm = S_data[IntVars::cons].DistributionMap();
 
-    amrex::ignore_unused(audit_qc_changes, step, audit_time);
-
     std::unique_ptr<MultiFab> dflux_x;
     std::unique_ptr<MultiFab> dflux_y;
     std::unique_ptr<MultiFab> dflux_z;
@@ -179,6 +178,26 @@ void erf_slow_rhs_post (int level, int finest_level,
         dflux_y = nullptr;
         dflux_z = nullptr;
     }
+
+#if defined(ERF_USE_NETCDF)
+    const bool do_qc_audit = audit_qc_changes && erf_qc_audit_enabled();
+    std::unique_ptr<MultiFab> audit_dqv_equiv;
+    std::unique_ptr<MultiFab> audit_qv_target;
+    std::unique_ptr<MultiFab> audit_qv_model;
+    std::unique_ptr<MultiFab> audit_qv_target_minus_model;
+    if (do_qc_audit && moist_set_rhs_bool) {
+        audit_dqv_equiv = std::make_unique<MultiFab>(ba, dm, 1, 0);
+        audit_qv_target = std::make_unique<MultiFab>(ba, dm, 1, 0);
+        audit_qv_model = std::make_unique<MultiFab>(ba, dm, 1, 0);
+        audit_qv_target_minus_model = std::make_unique<MultiFab>(ba, dm, 1, 0);
+        audit_dqv_equiv->setVal(0.);
+        audit_qv_target->setVal(0.);
+        audit_qv_model->setVal(0.);
+        audit_qv_target_minus_model->setVal(0.);
+    }
+#else
+    amrex::ignore_unused(audit_qc_changes, step, audit_time);
+#endif
 
     // Valid vars
     Vector<int> is_valid_slow_var; is_valid_slow_var.resize(RhoQ1_comp+1,0);
@@ -495,7 +514,12 @@ void erf_slow_rhs_post (int level, int finest_level,
                           old_stage_time_total, dt, start_bdy_time, final_bdy_time, bdy_time_interval,
                           bdy_factor, width, do_upwind, domain,
                           bdy_data_xlo, bdy_data_xhi, bdy_data_ylo, bdy_data_yhi,
-                          m_r2d);
+                          m_r2d,
+                          do_qc_audit,
+                          do_qc_audit ? audit_dqv_equiv->array(mfi) : Array4<Real>{},
+                          do_qc_audit ? audit_qv_target->array(mfi) : Array4<Real>{},
+                          do_qc_audit ? audit_qv_model->array(mfi) : Array4<Real>{},
+                          do_qc_audit ? audit_qv_target_minus_model->array(mfi) : Array4<Real>{});
         }
 #endif
 
@@ -632,4 +656,18 @@ void erf_slow_rhs_post (int level, int finest_level,
         } // end profile
       } // mfi
     } // OMP
+
+#if defined(ERF_USE_NETCDF)
+    if (do_qc_audit && moist_set_rhs_bool) {
+        Gpu::streamSynchronize();
+        erf_audit_ring_mf(geom, *audit_dqv_equiv, 0, "moist_set_dqv_equiv",
+                          level, step, audit_time, 5, "dqv_equiv", "QC_AUDIT_RHS");
+        erf_audit_ring_mf(geom, *audit_qv_target, 0, "moist_set_qv_target",
+                          level, step, audit_time, 5, "qv_target", "QC_AUDIT_RHS");
+        erf_audit_ring_mf(geom, *audit_qv_model, 0, "moist_set_qv_model",
+                          level, step, audit_time, 5, "qv_model", "QC_AUDIT_RHS");
+        erf_audit_ring_mf(geom, *audit_qv_target_minus_model, 0, "moist_set_qv_target_minus_model",
+                          level, step, audit_time, 5, "qv_target_minus_model", "QC_AUDIT_RHS");
+    }
+#endif
 }
